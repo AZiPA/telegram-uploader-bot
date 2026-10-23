@@ -6,7 +6,7 @@ Serverless Telegram file storage and sharing bot, powered by @tgcloud/bot. Versi
 
 > [!TIP]
 > **Prefer Cloudflare Workers + D1?**
-> Check out the sister repository: [telegram-filestore-bot](https://github.com/AZiPA/telegram-filestore-bot) for the Cloudflare Workers + D1 SQL database edition.
+> Check out the sister repository: [telegram-uploader-bot-cloudflare](https://github.com/AZiPA/telegram-uploader-bot-cloudflare) for the Cloudflare Workers + D1 SQL database edition.
 
 ---
 
