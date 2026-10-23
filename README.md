@@ -80,7 +80,7 @@ telegram-filestore-tgcloud/
 │       │   ├── maintenance.js  # Owner-only maintenance mode toggle & checks
 │       │   ├── members.js      # Staff list & admin/VIP promotion/demotion
 │       │   ├── members_panel.js# Staff management inline keyboards & panels
-│       │   ├── owner.js        # Root ownership assignment (/setbotowner, /ermia) & transfer
+│       │   ├── owner.js        # Root ownership assignment (/setbotowner) & transfer
 │       │   ├── profile.js      # Bot profile (name, about, description) state machine
 │       │   ├── profile_panel.js# Bot profile configuration keyboards
 │       │   ├── settings.js     # System settings handlers (quotas, TTLs, protections)
@@ -174,7 +174,7 @@ The database schema is defined in `tgcloud/schema.js` using `@tgcloud/bot` ORM D
 
 You do **not** need to hardcode `OWNER_ID` into environment variables or source code:
 1. **Cold Start (Zero-State):** When deployed on a fresh database where no owner exists in `system_config`, the bot automatically enters **Zero-State**.
-2. **Interactive Initialization:** In Zero-State, all general commands and media processing are gated except `/setbotowner` (and alias `/ermia`). The root owner initializes ownership interactively by executing `/setbotowner` in private chat.
+2. **Interactive Initialization:** In Zero-State, all general commands and media processing are gated except `/setbotowner`. The root owner initializes ownership interactively by executing `/setbotowner` in private chat.
 3. **Lockdown & Management:** Once claimed, ownership is securely written to `system_config`. The owner can now configure channels, promote admins, adjust settings, or transfer ownership at any time.
 
 ### Zero-Env Configuration
