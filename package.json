@@ -1,0 +1,14 @@
+{
+  "name": "telegram-uploader-bot",
+  "version": "1.0.0",
+  "description": "Serverless Telegram file sharing bot, powered by @tgcloud/bot",
+  "type": "module",
+  "main": "tgcloud/handlers/message.js",
+  "scripts": {
+    "postinstall": "node scripts/patch-snapshot.mjs"
+  },
+  "devDependencies": {
+    "@tgcloud/cli": "0.2.0",
+    "@types/node": "^26.6.4"
+  }
+}
