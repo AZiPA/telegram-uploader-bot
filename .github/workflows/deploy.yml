@@ -44,16 +44,15 @@ jobs:
           $CLI migrate --safe
           $CLI webhook sync
 
-      - name: Post-Deploy Hook (Seed Owner)
+      - name: Set Bot Owner
         env:
           OWNER_ID: ${{ secrets.OWNER_ID }}
           TGCLOUD_TOKEN: ${{ secrets.TGCLOUD_TOKEN }}
         run: |
           if [ -z "$OWNER_ID" ]; then
-            echo "ℹ️ No OWNER_ID secret provided. Bot deployed in Zero-State (awaits manual /setbotowner)."
+            echo "ℹ️ No OWNER_ID secret provided. Bot deployed in Zero-State."
             exit 0
           fi
 
           CLI="./node_modules/.bin/tgcloud"
-          PAYLOAD="{\"text\":\"/setbotowner\",\"from\":{\"id\":$OWNER_ID},\"chat\":{\"id\":$OWNER_ID,\"type\":\"private\"}}"
-          $CLI run handlers/message "$PAYLOAD"
+          $CLI run handlers/message "{\"owner_id\":$OWNER_ID}" --ctx "{\"ci_bootstrap\":true}"
