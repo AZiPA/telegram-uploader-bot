@@ -1,23 +1,41 @@
 import {
   bundles, bundleVotes, deletionQueue, adminSessions, userSessions,
-  userDownloads, forceChannels, vips, systemConfig
+  forceChannels, vips, systemConfig, admins, botConfig,
+  uploadSessions, uploadItems, adminTestContinuations
 } from '../../schema.js';
-import { db, sql, getRoleLevel, setConfig, sendMsg, tgApi, answerCq } from '../helpers.js';
+import { db, sql, getRoleLevel, setConfig, getConfig, configCache, sendMsg, tgApi, answerCq } from '../helpers.js';
 import { t } from '../locales/index.js';
 import { buildFactoryResetKeyboard } from './factory_reset.js';
+import { invalidateAdminsCache } from './members.js';
+import { invalidateConfigCache } from '../shared/config_service.js';
+import { fenceDeliveryReset } from '../core/operational_maintenance.js';
 
 export { buildFactoryResetKeyboard };
 
 export async function executeFactoryReset() {
+  await db.insert(systemConfig).values({ key: 'reset_in_progress', value: '1' })
+    .onConflictDoUpdate({ target: systemConfig.key, set: { value: '1' } }).run();
+  await fenceDeliveryReset();
+  // Fence already-running finalizers before removing their physical rows.
+  await db.update(uploadSessions).set({ state: 'deleted', revision: sql`revision + 1` }).run();
   await db.delete(bundles).run();
   await db.delete(bundleVotes).run();
   await db.delete(deletionQueue).run();
   await db.delete(adminSessions).run();
+  await db.delete(uploadItems).run();
+  await db.delete(uploadSessions).run();
+  await db.delete(adminTestContinuations).run();
   await db.delete(userSessions).run();
-  await db.delete(userDownloads).run();
+  // Audit history and accounting/security rows survive reset. In particular,
+  // clearing user_quotas would remove active bans and residual lockout strikes.
   await db.delete(forceChannels).run();
   await db.delete(vips).run();
+  await db.delete(botConfig).run();
+  await db.delete(admins).where(sql`role != 'owner'`).run();
   await db.delete(systemConfig).where(sql`"key" != 'owner_id'`).run();
+  configCache.clear();
+  invalidateAdminsCache();
+  invalidateConfigCache();
 }
 
 export async function handleMaintenanceCommand(cmd, arg, message, userId, chatId, lang, role) {
@@ -29,7 +47,14 @@ export async function handleMaintenanceCommand(cmd, arg, message, userId, chatId
 
   if (cmd === '/maintenance') {
     if (getRoleLevel(role) < 4) return sendMsg(chatId, t(lang, 'superadmin_only_command'));
-    const on = arg.trim().toLowerCase() === 'on' || arg.trim() === '1';
+    const trimmed = (arg || '').trim().toLowerCase();
+    let on;
+    if (!trimmed) {
+      const cur = (await getConfig('maintenance', 'off')) === 'on' || (await getConfig('maintenance_mode', '0')) === '1';
+      on = !cur;
+    } else {
+      on = trimmed === 'on' || trimmed === '1';
+    }
     await setConfig('maintenance', on ? 'on' : 'off');
     await setConfig('maintenance_mode', on ? '1' : '0');
     return sendMsg(chatId, t(lang, on ? 'maint_mode_enabled' : 'maint_mode_disabled'));

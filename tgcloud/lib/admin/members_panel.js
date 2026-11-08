@@ -5,7 +5,7 @@ import {
 } from '../helpers.js';
 import { t } from '../locales/index.js';
 import { sendMsg, editMsg, editMarkup, setAdminPrompt, answerCq } from '../helpers.js';
-import { removeAdmin, getAdmins } from './members.js';
+import { removeAdmin, getAdmins, invalidateAdminsCache, invalidateVipsCache } from './members.js';
 
 export function buildAdminsKeyboard(lang, admins = [], callerRoleOrLevel = 0, ownerId = null) {
   const callerLevel = typeof callerRoleOrLevel === 'number'
@@ -104,7 +104,13 @@ export async function renderVipsPanel({ chatId, messageId = null, lang, opts = {
 }
 
 export async function handleMembersCallback(data, cq, userId, chatId, messageId, lang, role) {
-  if (data === ACTIONS.ADMIN_MENU || data === ACTIONS.ADMIN_REFRESH) {
+  if (data === ACTIONS.ADMIN_REFRESH) {
+    await answerCq(cq);
+    invalidateAdminsCache();
+    return renderAdminsPanel({ chatId, messageId, lang, role });
+  }
+
+  if (data === ACTIONS.ADMIN_MENU) {
     await answerCq(cq);
     return renderAdminsPanel({ chatId, messageId, lang, role });
   }
@@ -157,6 +163,7 @@ export async function handleMembersCallback(data, cq, userId, chatId, messageId,
     if (callerLevel < 3) return answerCq(cq, t(lang, 'superadmin_only_command'), true);
     const countRes = (await db.select({ c: count() }).from(vips).get())?.c || 0;
     await db.delete(vips).run();
+    invalidateVipsCache();
     return editMsg(chatId, messageId, t(lang, 'vips_cleared_all', { count: countRes }), {
       reply_markup: buildVipsKeyboard(lang),
     });

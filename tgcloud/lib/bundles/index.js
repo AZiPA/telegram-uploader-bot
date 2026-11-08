@@ -3,7 +3,6 @@ import { canManageBundle } from './permissions.js';
 import { renderHub, handleHubCommand, handleHubCallback } from './hub_panel.js';
 import { renderReview, handleReviewCommand, handleReviewCallback } from './review_panel.js';
 import { handleProtectedCallback } from './protected.js';
-import { handlePinCommand, handlePinCallback, handleBundlePassPrompt } from './pin.js';
 import { handleExpiryCommand, handleExpiryCallback } from './expiry.js';
 import { handleRotationCommand, handleRotationCallback } from './rotation.js';
 import { handleDeleteCommand, handleDeleteCallback } from './deletion.js';
@@ -14,10 +13,7 @@ export {
   renderHub,
   renderReview,
   canManageBundle,
-  handleBundlePassPrompt,
 };
-
-export const handleBundleReply = handleBundlePassPrompt;
 
 export async function handleBundleCommand(cmd, arg, message, userId, chatId, lang, role, ctx) {
   userId = userId || message?.from?.id;
@@ -39,9 +35,6 @@ export async function handleBundleCommand(cmd, arg, message, userId, chatId, lan
   }
   if (cmd === '/setexpiry') {
     return handleExpiryCommand(cmd, arg, chatId, userId, lang, role);
-  }
-  if (cmd === '/setpass') {
-    return handlePinCommand(cmd, arg, chatId, userId, lang, role);
   }
   if (cmd === '/postbundle' || cmd === '/rotatelink') {
     return handleRotationCommand(cmd, arg, message, userId, chatId, lang, role, ctx);
@@ -65,9 +58,6 @@ export async function handleBundleCallback(data, cq, userId, chatId, messageId, 
   }
   if (data.startsWith('b:prot:') || data.startsWith('b:lock:') || data.startsWith('bnd:lock:')) {
     return handleProtectedCallback(data, cq, userId, chatId, messageId, lang, role);
-  }
-  if (data.startsWith('b:pass:')) {
-    return handlePinCallback(data, cq, userId, chatId, messageId, lang, role);
   }
   if (data.startsWith('b:1x:') || data.startsWith('b:exp:')) {
     return handleExpiryCallback(data, cq, userId, chatId, messageId, lang, role);

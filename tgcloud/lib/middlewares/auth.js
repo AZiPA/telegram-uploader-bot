@@ -1,5 +1,5 @@
 import { db, eq, and, or, sql, systemConfig, vips, getConfig, configCache } from '../helpers.js';
-import { getAdmins } from '../admin/members.js';
+import { getAdmins, getVips } from '../admin/members.js';
 
 export const ROLE_LEVELS = {
   owner: 4,
@@ -14,32 +14,23 @@ export function getRoleLevel(role) {
   return ROLE_LEVELS[role] ?? 0;
 }
 
-export async function claimOwnerAtomically(userId) {
+export async function claimOwnerAtomically(userId, database = db) {
   const strId = String(userId);
-  let claimed = false;
-  try {
-    await db.insert(systemConfig).values({ key: 'owner_id', value: strId }).run();
-    claimed = true;
-  } catch {}
-
+  const numericId = Number(userId);
+  if (!Number.isSafeInteger(numericId) || numericId <= 0) throw new Error('Invalid owner ID');
+  const inserted = await database.insert(systemConfig)
+    .values({ key: 'owner_id', value: strId })
+    .onConflictDoNothing({ target: systemConfig.key }).run();
+  let claimed = inserted.rowsAffected === 1;
   if (!claimed) {
-    try {
-      const res = await db.update(systemConfig)
-        .set({ value: strId })
-        .where(and(
-          eq(systemConfig.key, 'owner_id'),
-          or(eq(systemConfig.value, '0'), eq(systemConfig.value, ''))
-        ))
-        .run();
-      const affected = res?.rowsAffected ?? 0;
-      if (affected === 1) {
-        claimed = true;
-      }
-    } catch {}
+    const changed = await database.update(systemConfig).set({ value: strId })
+      .where(and(eq(systemConfig.key, 'owner_id'),
+        or(eq(systemConfig.value, '0'), eq(systemConfig.value, '')))).run();
+    claimed = changed.rowsAffected === 1;
   }
 
   if (claimed) {
-    configCache.set('owner_id', { raw: strId, exp: Math.floor(Date.now() / 1000) + 60 });
+    configCache.set('owner_id', { raw: strId, exp: Math.floor(Date.now() / 1000) + 15 });
   }
   return claimed;
 }
@@ -53,7 +44,7 @@ export async function getEffectiveOwnerId() {
     const cfgRow = await db.select().from(systemConfig).where(eq(systemConfig.key, 'owner_id')).get();
     if (cfgRow?.value && Number(cfgRow.value) > 0) {
       const ownerId = Number(cfgRow.value);
-      configCache.set('owner_id', { raw: String(ownerId), exp: Math.floor(Date.now() / 1000) + 60 });
+      configCache.set('owner_id', { raw: String(ownerId), exp: Math.floor(Date.now() / 1000) + 15 });
       return ownerId;
     }
   } catch {}
@@ -81,12 +72,8 @@ export async function getUserRole(userId) {
 
   try {
     const now = Math.floor(Date.now() / 1000);
-    const vipRow = await db.select().from(vips).where(
-      and(
-        eq(vips.user_id, numericId),
-        or(eq(vips.expires_at, 0), sql`${vips.expires_at} > ${now}`)
-      )
-    ).get();
+    const vipList = await getVips();
+    const vipRow = vipList?.find((v) => Number(v.user_id) === numericId && (Number(v.expires_at || 0) === 0 || Number(v.expires_at) > now));
     if (vipRow) return 'vip';
   } catch {}
 

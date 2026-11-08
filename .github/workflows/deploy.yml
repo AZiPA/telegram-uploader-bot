@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: tgcloud-${{ github.ref }}
+  group: tgcloud-deploy
   cancel-in-progress: false
 
 jobs:
@@ -16,10 +16,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - name: Setup Node.js 24
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -38,7 +40,19 @@ jobs:
 
           CLI="./node_modules/.bin/tgcloud"
 
-          $CLI status
           $CLI push --force
           $CLI migrate --safe
           $CLI webhook sync
+
+      - name: Set Bot Owner
+        env:
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          TGCLOUD_TOKEN: ${{ secrets.TGCLOUD_TOKEN }}
+        run: |
+          if [ -z "$OWNER_ID" ]; then
+            echo "ℹ️ No OWNER_ID secret provided. Bot deployed in Zero-State."
+            exit 0
+          fi
+
+          CLI="./node_modules/.bin/tgcloud"
+          $CLI run handlers/message "{\"owner_id\":$OWNER_ID}" --ctx "{\"ci_bootstrap\":true}"

@@ -3,6 +3,7 @@ import {
   sendMsg, editMsg, setAdminPrompt, clearAdminSession, answerCq
 } from '../helpers.js';
 import { t } from '../locales/index.js';
+import { getAdminSession } from '../shared/sessions.js';
 
 export function buildProfileKeyboard(lang) {
   return {
@@ -60,6 +61,7 @@ export async function renderBotProfileMenu(chatId, messageId = null, lang = 'en'
 }
 
 export async function handleProfileCallback(data, cq, userId, chatId, messageId, lang = 'en', role = 'user', _ctx = null) {
+  const observedSession = await getAdminSession(userId);
   if (data !== ACTIONS.BOT_PROFILE_MENU &&
       data !== 'bprof:menu' &&
       data !== ACTIONS.BOT_PROFILE_SET_NAME &&
@@ -183,7 +185,7 @@ export async function handleProfileCallback(data, cq, userId, chatId, messageId,
   }
 
   if (data === ACTIONS.BOT_PROFILE_CANCEL || data === 'bprof:cancel') {
-    await clearAdminSession(userId);
+    if (observedSession) await clearAdminSession(userId, observedSession);
     if (cq) await answerCq(cq, t(lang, 'profile_op_cancelled'));
     return renderBotProfileMenu(chatId, messageId, lang);
   }

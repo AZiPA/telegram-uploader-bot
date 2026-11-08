@@ -1,44 +1,62 @@
 import { api } from 'sdk';
 import {
-  db as defaultDb, eq, systemConfig, getConfig, setConfig,
-  tgApi as defaultTgApi, escapeHtml, bundles, bundleVotes, sendMsg
+  db as defaultDb, getConfig, tgApi as defaultTgApi, escapeHtml,
 } from '../helpers.js';
-import { logMissingStorageItems } from './log_channel.js';
-import { t } from '../locales/index.js';
-import { e } from '../shared/emojis.js';
+import { sendLogAlert } from './log_channel.js';
+import { setStorageSnapshot, getStorageSnapshot, disableStorageSnapshot } from '../shared/config.js';
 
-function applyEmojis(text, isPremium) {
-  if (!text || !isPremium) return text;
-  return text
-    .replaceAll('📦', e('bundle', isPremium))
-    .replaceAll('📁', e('folder', isPremium))
-    .replaceAll('🔒', e('lock', isPremium))
-    .replaceAll('🔓', e('unlocked', isPremium))
-    .replaceAll('⭐️', e('vip', isPremium))
-    .replaceAll('📥', e('download', isPremium))
-    .replaceAll('⚠️', e('warning', isPremium));
+export const DELIVERY_LIFECYCLE_HOOKS = true;
+const MEDIA_METHODS = {
+  photo: 'sendPhoto', document: 'sendDocument', video: 'sendVideo', audio: 'sendAudio',
+  voice: 'sendVoice', video_note: 'sendVideoNote', animation: 'sendAnimation', sticker: 'sendSticker',
+};
+const positiveMessageId = (id) => Number.isSafeInteger(id) && id > 0;
+
+// Classify an actual invoked method in context. Description text alone is not
+// evidence of a rejected source reference, particularly for transport/5xx errors.
+export function classifyDeliveryError(error, context = {}) {
+  const code = Number(error?.code || 0);
+  const description = String(error?.description || error?.message || '');
+  const method = context.method;
+  const knownMethod = Object.values(MEDIA_METHODS).includes(method) || method === 'copyMessages';
+  if (!knownMethod || (error?.method && error.method !== method)) return { kind: 'unknown' };
+  if (code === 429) {
+    const delay = Number(error?.parameters?.retry_after);
+    return { kind: 'rate_limited', retryAfter: Number.isFinite(delay) && delay > 0 ? Math.ceil(delay) : 60 };
+  }
+  // Unexpected recovery parameters contradict a source-reference diagnosis.
+  // Preserve uncertain outcomes rather than inferring delivery rejection.
+  if (error?.parameters?.retry_after !== undefined || error?.parameters?.migrate_to_chat_id !== undefined) {
+    const delay = Number(error?.parameters?.retry_after);
+    return { kind: 'unknown', ...(Number.isFinite(delay) && delay > 0 ? { retryAfter: Math.ceil(delay) } : {}) };
+  }
+  if (code < 400 || code >= 500) return { kind: 'unknown' };
+  if (/blocked by the user|user is deactivated|bot cannot initiate|bot can.t initiate|chat not found/i.test(description)) {
+    return { kind: 'recipient' };
+  }
+  if (context.source === 'file_id' && code === 400 && Object.values(MEDIA_METHODS).includes(method)
+    && /^(?:Bad Request:\s*)?(?:FILE_REFERENCE_EXPIRED|file reference (?:has )?expired|wrong (?:remote )?file identifier(?:\/HTTP URL)? specified(?:[:.].*)?|invalid file[_ ]id)(?:\s*\.?$)/i.test(description)) {
+    return { kind: 'source_dead' };
+  }
+  if (context.source === 'storage' && method === 'copyMessages' && [400, 403].includes(code)) {
+    // Protected-source errors name the source. Membership errors are attributed
+    // to storage only when the destination is a private recipient, not a channel.
+    const protectedSource = /CHAT_FORWARDS_RESTRICTED|message is protected/i.test(description);
+    const sourceMembership = Number(context.destinationChatId) > 0
+      && /bot was kicked from (?:the )?channel|bot is not a member of (?:the )?channel/i.test(description);
+    if (context.sourceChannelId && (protectedSource || sourceMembership)) return { kind: 'storage_fatal' };
+  }
+  return { kind: 'definitive' };
 }
 
-function detectActualMediaType(errorDesc) {
-  if (!errorDesc || typeof errorDesc !== 'string') return null;
-  const SUPPORTED = ['photo', 'document', 'video', 'audio', 'voice', 'video_note', 'animation', 'sticker'];
-
-  const m1 = errorDesc.match(/can\x27t use ([a-z_]+) with (?:send)?([a-z_]+)/i);
-  if (m1 && SUPPORTED.includes(m1[1].toLowerCase())) {
-    return m1[1].toLowerCase();
-  }
-
-  const m2 = errorDesc.match(/expected ([a-z_]+),? (?:got|found) ([a-z_]+)/i);
-  if (m2 && SUPPORTED.includes(m2[2].toLowerCase())) {
-    return m2[2].toLowerCase();
-  }
-
-  const m3 = errorDesc.match(/(?:type mismatch|file of type|wrong type)[^a-z_]*([a-z_]+)/i);
-  if (m3 && SUPPORTED.includes(m3[1].toLowerCase())) {
-    return m3[1].toLowerCase();
-  }
-
-  return null;
+// These fields are the recorded copy provenance. A legacy post ID or the
+// currently configured channel cannot supply missing historical provenance.
+export function backupReference(item) {
+  const channel = typeof item?.storage_channel_id === 'string' || typeof item?.storage_channel_id === 'number'
+    ? String(item.storage_channel_id).trim() : '';
+  if (!/^-100[0-9]+$/.test(channel) || !Number.isSafeInteger(Number(channel))
+    || !positiveMessageId(item?.storage_message_id)) return null;
+  return { channelId: channel, messageId: item.storage_message_id };
 }
 
 /**
@@ -141,15 +159,14 @@ export async function registerStorageChannel(channelId, userLevel = 0, tgApi = d
   }
 
   const cleanId = String(channelId).trim();
-  await setConfig('storage_channel_id', cleanId);
-  await setConfig('storage_channel_active', 'true');
+  await setStorageSnapshot({ channel_id: cleanId, enabled: true });
   return { ok: true, channelId: cleanId };
 }
 
 /**
  * Copy media to storage channel:
  * - If storageChannelId is configured, copy the message via tgApi.copyMessage and return { message_id, channel_id }.
- * - On runtime copy errors (403 or 400), automatically trips the circuit-breaker (storage_channel_active = 'false').
+ * - Configuration failure handling belongs to the caller's captured snapshot.
  *
  * @param {object} msg
  * @param {object} media
@@ -169,238 +186,103 @@ export async function copyMediaToStorage(msg, media, mediaType, storageChannelId
     throw new Error('Invalid message for copyMediaToStorage');
   }
 
-  try {
-    const copyRes = await tgApi.copyMessage({
-      chat_id: storageChannelId,
-      from_chat_id: fromChatId,
-      message_id: messageId,
-    });
-
-    if (copyRes?.message_id) {
-      return { message_id: copyRes.message_id, channel_id: String(storageChannelId) };
-    }
-    throw new Error('No message_id in copyMessage response');
-  } catch (err) {
-    const status = Number(err?.code || err?.status || 0);
-    const desc = String(err?.description || err?.message || '');
-    const isChannelFatal =
-      status === 403 ||
-      (status === 400 && (
-        desc.includes('CHAT_ADMIN_REQUIRED') ||
-        desc.includes('CHAT_FORWARDS_RESTRICTED') ||
-        desc.toLowerCase().includes('kicked') ||
-        desc.toLowerCase().includes('chat not found')
-      ));
-    if (isChannelFatal) {
-      await setConfig('storage_channel_active', 'false');
-    }
-    throw err;
+  const copyRes = await tgApi.copyMessage({
+    chat_id: storageChannelId,
+    from_chat_id: fromChatId,
+    message_id: messageId,
+  });
+  if (Number.isSafeInteger(copyRes?.message_id) && copyRes.message_id > 0) {
+    return { message_id: copyRes.message_id, channel_id: String(storageChannelId) };
   }
+  throw new Error('No positive message_id in copyMessage response');
 }
 
-/**
- * Deliver media items implementing 3-Stage Fallback Delivery:
- * - Stage 1 (Primary): Deliver using file_id.
- * - Stage 2 (Fallback on Error): If file_id delivery throws Bot API 400 (FILE_REFERENCE_EXPIRED, invalid file id):
- *   - Check if item has storage_message_id AND storage_channel_active === 'true'.
- *   - If NO backup available: delete bundle from bundles & bundle_votes, inform user, return pruned.
- *   - If backup exists: attempt copyMessages from storage channel.
- *     - If copy fails: prune bundle from DB and inform user.
- *     - If copy succeeds: Scenario C (type mismatch self-healing) - update bundle's items in DB with true media type.
- *
- * @param {string|number} chatId
- * @param {Array<object>} items
- * @param {object} [tgApi]
- * @param {object} [options]
- * @returns {Promise<{ sentIds: Array<number>, deliveredCount: number, rateLimited: boolean, retryAfter?: number, pruned?: boolean }>}
- */
+// One source message per copyMessages call gives an unambiguous receipt mapping.
+// Hooks persist each boundary and receipt; bookkeeping errors deliberately
+// propagate outside the Telegram catch and can never trigger another send.
 export async function deliverMediaItems(chatId, items, tgApi = defaultTgApi, options = {}) {
   const protect = Boolean(options.protect || options.protect_content);
-  const isPremium = Boolean(options.isPremium);
-  const lang = options.lang || 'en';
-  const bundleCode = options.bundleCode || null;
-  const db = options.db || defaultDb;
-
-  const storageActive = (await getConfig('storage_channel_active', 'false')) === 'true';
-  const rawStorage = options.storageChannelId !== undefined ? options.storageChannelId : (storageActive ? await getStorageChannelId(db) : null);
-  const storageChannelId = (storageActive && rawStorage && !['off', '0', 'clear', 'disable', 'none'].includes(String(rawStorage).trim().toLowerCase()))
-    ? String(rawStorage).trim()
-    : null;
-
-  const getItemStorageId = (it) => (it.storage_message_id != null ? it.storage_message_id : (it.post_message_id != null ? it.post_message_id : null));
-
-  let sentIds = [];
-  let deliveredCount = 0;
-
+  const sentIds = [];
+  const result = (outcome = null) => ({ sentIds, deliveredCount: sentIds.length,
+    rateLimited: outcome?.kind === 'rate_limited',
+    ...(outcome?.retryAfter ? { retryAfter: outcome.retryAfter } : {}),
+    unknown: outcome?.kind === 'unknown', definitiveFailure: Boolean(outcome && !['unknown', 'rate_limited'].includes(outcome.kind)),
+    pruned: false, ...(outcome ? { outcome } : {}),
+  });
+  const notifyOutcome = async (item, outcome) => {
+    if (options.onOutcome) await options.onOutcome(item, outcome);
+  };
+  const confirm = async (item, id, stage) => {
+    if (options.onConfirmed) await options.onConfirmed(item, id, stage);
+    sentIds.push(id);
+  };
+  const invoke = (method, payload) => {
+    const target = tgApi && typeof tgApi[method] === 'function' ? tgApi : api;
+    return target[method](payload);
+  };
   for (const item of items) {
-    let sentMessageId = null;
-    let fileIdError = null;
-
-    // Stage 1 (Primary): Deliver using file_id
+    let primaryOutcome = { kind: 'source_dead' };
     if (item.file_id) {
-      try {
-        const sendOpts = { chat_id: chatId, protect_content: protect };
-        if (item.caption && ['photo', 'document', 'video', 'audio', 'voice', 'animation'].includes(item.type)) {
-          sendOpts.caption = escapeHtml(String(item.caption).slice(0, 1024));
-          sendOpts.parse_mode = 'HTML';
-        }
-
-        const callTg = (method, params) => {
-          if (tgApi && typeof tgApi[method] === 'function') {
-            return tgApi[method](params);
-          }
-          if (typeof api[method] === 'function') {
-            return api[method](params);
-          }
-          throw new Error(`Method ${method} not found on tgApi or api`);
-        };
-
-        let res;
-        if (item.type === 'photo') {
-          res = await callTg('sendPhoto', { ...sendOpts, photo: item.file_id });
-        } else if (item.type === 'video') {
-          res = await callTg('sendVideo', { ...sendOpts, video: item.file_id });
-        } else if (item.type === 'audio') {
-          res = await callTg('sendAudio', { ...sendOpts, audio: item.file_id });
-        } else if (item.type === 'voice') {
-          res = await callTg('sendVoice', { ...sendOpts, voice: item.file_id });
-        } else if (item.type === 'video_note') {
-          res = await callTg('sendVideoNote', { chat_id: chatId, protect_content: protect, video_note: item.file_id });
-        } else if (item.type === 'animation') {
-          res = await callTg('sendAnimation', { ...sendOpts, animation: item.file_id });
-        } else if (item.type === 'sticker') {
-          res = await callTg('sendSticker', { chat_id: chatId, protect_content: protect, sticker: item.file_id });
-        } else {
-          res = await callTg('sendDocument', { ...sendOpts, document: item.file_id });
-        }
-
-        sentMessageId = res?.message_id || null;
-      } catch (err) {
-        const is429 = err?.code === 429 || err?.status === 429 || Boolean(err?.parameters?.retry_after);
-        if (is429) {
-          const retryAfter = Number(err?.parameters?.retry_after) || 60;
-          return { sentIds, deliveredCount, rateLimited: true, retryAfter, pruned: false };
-        }
-        fileIdError = err;
+      const type = MEDIA_METHODS[item.type] ? item.type : 'document';
+      const method = MEDIA_METHODS[type];
+      const payload = { chat_id: chatId, protect_content: protect, [type]: item.file_id };
+      if (item.caption && ['photo', 'document', 'video', 'audio', 'voice', 'animation'].includes(type)) {
+        payload.caption = escapeHtml(String(item.caption).slice(0, 1024));
+        payload.parse_mode = 'HTML';
       }
-    } else {
-      fileIdError = new Error('No file_id');
-      fileIdError.code = 400;
+      if (options.beforeDispatch) await options.beforeDispatch(item, 'primary', method);
+      let response;
+      try {
+        response = await invoke(method, payload);
+        primaryOutcome = null;
+      } catch (error) {
+        primaryOutcome = classifyDeliveryError(error, { method, source: 'file_id', destinationChatId: chatId });
+      }
+      if (!primaryOutcome) {
+        if (positiveMessageId(response?.message_id)) {
+          await confirm(item, response.message_id, 'primary');
+          continue;
+        }
+        primaryOutcome = { kind: 'unknown' };
+      }
+      await notifyOutcome(item, primaryOutcome);
+      if (primaryOutcome.kind !== 'source_dead') return result(primaryOutcome);
     }
-
-    if (sentMessageId) {
-      sentIds.push(sentMessageId);
-      deliveredCount++;
+    const reference = backupReference(item);
+    const snapshot = await getStorageSnapshot();
+    if (!snapshot.enabled || !reference) {
+      const outcome = { kind: 'definitive' };
+      await notifyOutcome(item, outcome);
+      return result(outcome);
+    }
+    if (options.beforeDispatch) await options.beforeDispatch(item, 'backup', 'copyMessages');
+    let response, copyError, outcome;
+    try {
+      response = await invoke('copyMessages', { chat_id: chatId, from_chat_id: reference.channelId,
+        message_ids: [reference.messageId], protect_content: protect });
+    } catch (error) {
+      copyError = error;
+      outcome = classifyDeliveryError(error, { method: 'copyMessages', source: 'storage',
+        sourceChannelId: reference.channelId, destinationChatId: chatId });
+    }
+    if (!outcome && Array.isArray(response) && response.length === 1 && positiveMessageId(response[0]?.message_id)) {
+      // copyMessages returns MessageId objects, so no source file/type metadata
+      // can be repaired from this response. The existing item remains unchanged.
+      await confirm(item, response[0].message_id, 'backup');
       continue;
     }
-
-    // Stage 2 (Fallback on Error):
-    // If file_id delivery throws Bot API 400 (FILE_REFERENCE_EXPIRED, invalid file id)
-    const errCode = Number(fileIdError?.code || fileIdError?.status || 0);
-    const errDesc = String(fileIdError?.description || fileIdError?.message || '');
-    const is400 = errCode === 400 || errDesc.includes('FILE_REFERENCE_EXPIRED') || errDesc.toLowerCase().includes('wrong remote file identifier') || errDesc.toLowerCase().includes('file identifier') || errDesc.toLowerCase().includes('invalid file');
-
-    if (!is400) {
-      console.error('Non-400 error delivering item via file_id:', errDesc);
-      break;
-    }
-
-    const itemStorageId = getItemStorageId(item);
-    const hasBackup = Boolean(storageActive && storageChannelId && itemStorageId != null);
-
-    if (!hasBackup) {
-      // If NO backup available (storage channel inactive OR storage_message_id is null):
-      // Delete the bundle from bundles and bundle_votes (keep user_downloads intact).
-      // Notify user that the file is no longer available.
-      // Return.
-      if (bundleCode) {
-        await db.delete(bundleVotes).where(eq(bundleVotes.code, bundleCode)).run();
-        await db.delete(bundles).where(eq(bundles.code, bundleCode)).run();
-      }
-      await sendMsg(chatId, applyEmojis(t(lang, 'file_not_found'), isPremium));
-      return { sentIds, deliveredCount, rateLimited: false, pruned: true };
-    }
-
-    // If backup exists: Attempt copyMessages from the storage channel.
-    let copyRes = null;
-    let copyErr = null;
-    try {
-      const batchRes = await tgApi.copyMessages({
-        chat_id: chatId,
-        from_chat_id: storageChannelId,
-        message_ids: [itemStorageId],
-        protect_content: protect,
-      });
-      if (Array.isArray(batchRes) && batchRes.length > 0 && batchRes[0]?.message_id) {
-        copyRes = batchRes[0];
-      }
-    } catch (bErr) {
-      copyErr = bErr;
+    outcome ||= { kind: 'unknown' };
+    await notifyOutcome(item, outcome);
+    if (outcome.kind === 'storage_fatal' && snapshot.channel_id === reference.channelId) {
+      // Storage and logging remain optional. A late error is fenced by the
+      // exact captured generation, including configure-away-and-back races.
       try {
-        const singleRes = await tgApi.copyMessage({
-          chat_id: chatId,
-          from_chat_id: storageChannelId,
-          message_id: itemStorageId,
-          protect_content: protect,
-        });
-        if (singleRes?.message_id) {
-          copyRes = singleRes;
-          copyErr = null;
+        if (await disableStorageSnapshot(snapshot)) {
+          await sendLogAlert('Storage Channel Error', `Storage channel deactivated: ${escapeHtml(reference.channelId)}. ${escapeHtml(String(copyError?.description || 'Source is inaccessible'))}`).catch(() => {});
         }
-      } catch (sErr) {
-        copyErr = sErr;
-      }
+      } catch (_) {}
     }
-
-    if (!copyRes?.message_id) {
-      // If copy fails (message deleted from channel): prune bundle from DB and inform user.
-      const copyStatus = Number(copyErr?.code || copyErr?.status || 0);
-      const copyDesc = String(copyErr?.description || copyErr?.message || '');
-      if (
-        copyStatus === 403 ||
-        (copyStatus === 400 && (copyDesc.includes('CHAT_ADMIN_REQUIRED') || copyDesc.includes('CHAT_FORWARDS_RESTRICTED') || copyDesc.toLowerCase().includes('kicked') || copyDesc.toLowerCase().includes('chat not found')))
-      ) {
-        await setConfig('storage_channel_active', 'false');
-      }
-      if (bundleCode) {
-        await db.delete(bundleVotes).where(eq(bundleVotes.code, bundleCode)).run();
-        await db.delete(bundles).where(eq(bundles.code, bundleCode)).run();
-      }
-      await sendMsg(chatId, applyEmojis(t(lang, 'file_not_found'), isPremium));
-      return { sentIds, deliveredCount, rateLimited: false, pruned: true };
-    }
-
-    // Copy succeeded!
-    sentIds.push(copyRes.message_id);
-    deliveredCount++;
-
-    // Scenario C (Type mismatch self-healing): If the actual media type in storage differs from items record in DB, update the bundle's items in DB with the true media type.
-    const actualType = detectActualMediaType(errDesc);
-    if (actualType && actualType !== item.type && bundleCode) {
-      item.type = actualType;
-      try {
-        const bRow = await db.select({ items: bundles.items }).from(bundles).where(eq(bundles.code, bundleCode)).get();
-        if (bRow) {
-          const allItems = typeof bRow.items === 'string' ? JSON.parse(bRow.items) : (Array.isArray(bRow.items) ? bRow.items : []);
-          const updatedItems = allItems.map((it) => {
-            const matchesUnique = item.file_unique_id && it.file_unique_id === item.file_unique_id;
-            const matchesStorage = itemStorageId != null && (it.storage_message_id === itemStorageId || it.post_message_id === itemStorageId);
-            const matchesFileId = item.file_id && it.file_id === item.file_id;
-            if (matchesUnique || matchesStorage || matchesFileId) {
-              return { ...it, type: actualType };
-            }
-            return it;
-          });
-          await db.update(bundles)
-            .set({ items: JSON.stringify(updatedItems) })
-            .where(eq(bundles.code, bundleCode))
-            .run();
-        }
-      } catch (dbErr) {
-        console.error('Failed to self-heal bundle item type in DB:', dbErr);
-      }
-    }
+    return result(outcome);
   }
-
-  return { sentIds, deliveredCount, rateLimited: false, pruned: false };
+  return result();
 }

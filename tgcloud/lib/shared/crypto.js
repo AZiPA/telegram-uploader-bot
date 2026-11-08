@@ -65,19 +65,3 @@ export function generateCode(arg = 8) {
   }
   return generateBase62Code(arg);
 }
-
-export async function hashBundlePin(bundle, pin) {
-  const salt = String(bundle?.created_at || bundle?.created_by || bundle?.creator_id || 'salt');
-  const hash = await sha256Hex(`${salt}:${pin}`);
-  return `v2:${hash}`;
-}
-
-export async function verifyBundlePin(bundle, pin) {
-  if (!bundle || !bundle.passcode_hash || !pin) return false;
-  if (String(bundle.passcode_hash).startsWith('v2:')) {
-    const expected = await hashBundlePin(bundle, pin);
-    return bundle.passcode_hash === expected;
-  }
-  const legacyHash = await sha256Hex(`${bundle.code}:${pin}`);
-  return bundle.passcode_hash === legacyHash;
-}

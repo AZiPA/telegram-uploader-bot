@@ -15,58 +15,39 @@ export const EMOJI_REGISTRY = {
   warning:  ['⚠️', '6237772568112142557'],
 };
 
+const UNICODE_TO_EMOJI_NAME = {
+  '📦': 'bundle',
+  '📁': 'folder',
+  '🔒': 'lock',
+  '🔓': 'unlocked',
+  '⭐️': 'vip',
+  '✅': 'success',
+  '❌': 'danger',
+  '📊': 'stats',
+  '⚙️': 'settings',
+  '🔍': 'search',
+  '📥': 'download',
+  '⚠️': 'warning',
+};
+
+const EMOJI_TOKEN_REGEX = /(<tg-emoji[^>]*>[\s\S]*?<\/tg-emoji>)|(📦|📁|🔒|🔓|⭐️|✅|❌|📊|⚙️|🔍|📥|⚠️)/gu;
+
+export function applyEmojis(text, isPremium = false) {
+  if (!text || !isPremium) return text;
+  return String(text).replace(EMOJI_TOKEN_REGEX, (match, existingTag, unicodeEmoji) => {
+    if (existingTag) return existingTag;
+    const name = UNICODE_TO_EMOJI_NAME[unicodeEmoji];
+    return name ? e(name, true) : match;
+  });
+}
+
 export async function isPremiumEmojiEnabled(db = defaultDb) {
   try {
-    const targetDb = db || defaultDb;
-    if (targetDb) {
-      if (typeof targetDb.query?.systemConfig?.findFirst === 'function') {
-        const row = await targetDb.query.systemConfig.findFirst({
-          where: (tbl, { eq }) => eq(tbl.key, 'premium_emojis_enabled'),
-        });
-        return row?.value === 'true';
-      }
-      if (typeof targetDb.query?.system_config?.findFirst === 'function') {
-        const row = await targetDb.query.system_config.findFirst({
-          where: (tbl, { eq }) => eq(tbl.key, 'premium_emojis_enabled'),
-        });
-        return row?.value === 'true';
-      }
-      if (typeof targetDb.systemConfig?.findFirst === 'function') {
-        const row = await targetDb.systemConfig.findFirst({
-          where: (tbl, { eq }) => eq(tbl.key, 'premium_emojis_enabled'),
-        });
-        return row?.value === 'true';
-      }
-      if (typeof targetDb.system_config?.findFirst === 'function') {
-        const row = await targetDb.system_config.findFirst({
-          where: (tbl, { eq }) => eq(tbl.key, 'premium_emojis_enabled'),
-        });
-        return row?.value === 'true';
-      }
-      if (typeof targetDb.prepare === 'function') {
-        try {
-          const stmt = targetDb.prepare("SELECT value FROM system_config WHERE key = 'premium_emojis_enabled'");
-          const row = typeof stmt.first === 'function' ? await stmt.first() : (typeof stmt.get === 'function' ? await stmt.get() : await stmt.all());
-          const val = Array.isArray(row) ? row[0]?.value : row?.value;
-          if (val !== undefined) return val === 'true';
-        } catch (_) {}
-      }
-      if (typeof targetDb.query === 'function') {
-        try {
-          const res = await targetDb.query("SELECT value FROM system_config WHERE key = 'premium_emojis_enabled'");
-          const row = Array.isArray(res) ? res[0] : (res?.rows?.[0] || res?.[0]);
-          if (row?.value !== undefined) return row.value === 'true';
-        } catch (_) {}
-      }
-    }
-    if (typeof getConfig === 'function') {
-      const val = await getConfig('premium_emojis_enabled', 'false');
-      return val === 'true';
-    }
+    const val = await getConfig('premium_emojis_enabled', 'false');
+    return val === 'true';
   } catch (_) {
     return false;
   }
-  return false;
 }
 
 export function e(name, isPremium = false) {

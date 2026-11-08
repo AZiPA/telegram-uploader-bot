@@ -38,11 +38,25 @@ export const createInlineButton = buildInlineButton;
 export function buildDeliveryKeyboard(lang, code, opts = {}) {
   const rows = [];
   const isPremium = Boolean(opts.isPremium);
+  if (opts.adminTestCallbacks) {
+    if (opts.nextOffset != null && opts.remainingCount > 0) {
+      rows.push([buildInlineButton(
+        t(lang, 'delivery_next_part', { count: opts.remainingCount }),
+        opts.adminTestCallbacks.next,
+        opts.iconNext || 'download', isPremium
+      )]);
+    }
+    rows.push([buildInlineButton(
+      t(lang, 'btn_redownload'), opts.adminTestCallbacks.restart,
+      opts.iconRedownload || 'download', isPremium
+    )]);
+    return { inline_keyboard: rows };
+  }
   if (opts.nextOffset != null && opts.remainingCount > 0) {
     rows.push([
       buildInlineButton(
         t(lang, 'delivery_next_part', { count: opts.remainingCount }),
-        `${ACTIONS.CHUNK_DELIVERY}${code}:${opts.nextOffset}`,
+        opts.continuationData || `${ACTIONS.CHUNK_DELIVERY}${code}:${opts.nextOffset}`,
         opts.iconNext || 'download',
         isPremium
       )

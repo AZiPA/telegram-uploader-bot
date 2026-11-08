@@ -2,6 +2,7 @@ import { db, eq, and, sql, bundles, bundleVotes, tgApi, ACTIONS, answerCq, nowSe
 import { buildDeliveryKeyboard } from '../shared/buttons.js';
 import { isPremiumEmojiEnabled } from '../shared/emojis.js';
 import { t } from '../locales/index.js';
+import { bundleAvailable } from '../bundles/lifecycle.js';
 
 export async function handleVoteCallback(data, cq, userId, chatId, messageId, lang) {
   if (data.startsWith(ACTIONS.VOTE_LIKE) || data.startsWith(ACTIONS.VOTE_DISLIKE)) {
@@ -12,7 +13,7 @@ export async function handleVoteCallback(data, cq, userId, chatId, messageId, la
     const bundleExists = await db
       .select({ code: bundles.code })
       .from(bundles)
-      .where(eq(bundles.code, code))
+      .where(and(eq(bundles.code, code), bundleAvailable()))
       .get();
     if (!bundleExists) {
       return answerCq(cq, t(lang, 'file_not_found'), true);

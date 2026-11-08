@@ -21,8 +21,26 @@ export async function getAdmins() {
   }
   const rows = await db.select().from(admins).all();
   cachedAdmins = rows || [];
-  cachedAdminsExpiresAt = Date.now() + 60000;
+  cachedAdminsExpiresAt = Date.now() + 15000;
   return cachedAdmins;
+}
+
+let cachedVips = null;
+let cachedVipsExpiresAt = 0;
+
+export function invalidateVipsCache() {
+  cachedVips = null;
+  cachedVipsExpiresAt = 0;
+}
+
+export async function getVips() {
+  if (cachedVips && Date.now() < cachedVipsExpiresAt) {
+    return cachedVips;
+  }
+  const rows = await db.select().from(vips).all();
+  cachedVips = rows || [];
+  cachedVipsExpiresAt = Date.now() + 15000;
+  return cachedVips;
 }
 
 export async function isAdmin(userId) {
@@ -152,6 +170,7 @@ export async function handleMembersCommand(cmd, arg, message, userId, chatId, la
         added_by: Number(userId),
       },
     }).run();
+    invalidateVipsCache();
     return sendMsg(chatId, t(lang, 'addvip_applied', { id: vId, term }));
   }
 
@@ -167,6 +186,7 @@ export async function handleMembersCommand(cmd, arg, message, userId, chatId, la
     const res = await db.delete(vips).where(eq(vips.user_id, vId)).run();
     const affected = res?.rowsAffected ?? 0;
     if (affected === 0) return sendMsg(chatId, t(lang, 'vip_not_found', { id: vId }));
+    invalidateVipsCache();
     return sendMsg(chatId, t(lang, 'delvip_applied', { id: vId }));
   }
 
@@ -179,6 +199,15 @@ export async function handleMembersCommand(cmd, arg, message, userId, chatId, la
   if (cmd === '/ban') {
     const parts = (arg || '').trim().split(/\s+/), bId = Number(parts[0]);
     if (!bId || Number.isNaN(bId) || bId <= 0) return sendMsg(chatId, t(lang, 'ban_usage'));
+
+    let days = 30;
+    if (parts[1] !== undefined) {
+      const parsedDays = Number(parts[1]);
+      if (!Number.isInteger(parsedDays) || parsedDays < 1 || parsedDays > 3650) {
+        return sendMsg(chatId, t(lang, 'ban_usage'));
+      }
+      days = parsedDays;
+    }
 
     const ownerId = await getEffectiveOwnerId();
     if (bId === ownerId) return sendMsg(chatId, t(lang, 'admin_cannot_manage_owner'));
@@ -199,7 +228,7 @@ export async function handleMembersCommand(cmd, arg, message, userId, chatId, la
     }
 
     const now = nowSec();
-    const days = Number(parts[1]) || 30, banUntil = now + days * 86400;
+    const banUntil = now + days * 86400;
     await db.insert(userQuotas).values({
       user_id: bId,
       last_download_date: sql`date('now')`,
@@ -214,7 +243,7 @@ export async function handleMembersCommand(cmd, arg, message, userId, chatId, la
   if (cmd === '/unban') {
     const uId = Number(arg?.trim());
     if (!uId) return sendMsg(chatId, t(lang, 'unban_usage'));
-    await db.update(userQuotas).set({ banned_until: 0 }).where(eq(userQuotas.user_id, uId)).run();
+    await db.update(userQuotas).set({ banned_until: 0, strikes: 0 }).where(eq(userQuotas.user_id, uId)).run();
     return sendMsg(chatId, t(lang, 'unban_applied', { id: uId }));
   }
 
@@ -224,7 +253,8 @@ export async function handleMembersCommand(cmd, arg, message, userId, chatId, la
 export async function handleMembersPrompt(session, text, userId, chatId, lang) {
   if (session.mode !== 'add_admin') return false;
 
-  await clearAdminSession(userId);
+  const cleared = await clearAdminSession(userId, session);
+  if ((cleared?.rowsAffected ?? 0) !== 1) return false;
 
   const callerRole = await getUserRole(userId);
   const callerLevel = getRoleLevel(callerRole);

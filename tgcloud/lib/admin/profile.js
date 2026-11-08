@@ -2,6 +2,7 @@ import { InputFile, api as sdkApi } from 'sdk';
 import { tgApi, escapeHtml, sendMsg, clearAdminSession, ACTIONS, db as defaultDb } from '../helpers.js';
 import { t } from '../locales/index.js';
 import { buildProfileKeyboard, buildBotProfileKeyboard, renderBotProfileMenu } from './profile_panel.js';
+import { getAdminSession } from '../shared/sessions.js';
 
 export async function setBotProfilePhoto(fileId, api = tgApi, mimeType = 'image/jpeg') {
   const client = (api && typeof api.setMyProfilePhoto === 'function') ? api : tgApi;
@@ -96,7 +97,8 @@ export async function removeBotProfilePhoto(api = tgApi) {
   }
 }
 
-export async function handleProfilePhoto(message, userId, chatId, lang, api = tgApi, db = defaultDb) {
+export async function handleProfilePhoto(message, userId, chatId, lang, api = tgApi, db = defaultDb, expectedSession = null) {
+  const session = expectedSession || await getAdminSession(userId, db);
   let fileId = null;
   let mimeType = 'image/jpeg';
 
@@ -110,14 +112,17 @@ export async function handleProfilePhoto(message, userId, chatId, lang, api = tg
   }
 
   if (fileId) {
+    if (!session || (session.mode !== 'bprof_waiting_photo' && session.action !== 'bprof_waiting_photo')) return false;
+    // Claim this exact prompt before its Telegram side effect. A stale reply
+    // must not mutate the profile after another operation replaces the prompt.
+    const cleared = await clearAdminSession(userId, session, db);
+    if ((cleared?.rowsAffected ?? 0) !== 1) return false;
     try {
       await setBotProfilePhoto(fileId, api, mimeType);
-      await clearAdminSession(userId);
       await sendMsg(chatId, t(lang, 'profile_photo_updated'));
       return await renderBotProfileMenu(chatId, null, lang, api, db);
     } catch (err) {
       console.error('Failed to set bot profile photo:', err);
-      await clearAdminSession(userId);
       const errMsg = err?.description || err?.message || 'Error';
       await sendMsg(chatId, `❌ <b>Error:</b> <code>${escapeHtml(errMsg)}</code>`);
       return await renderBotProfileMenu(chatId, null, lang, api, db);
@@ -152,7 +157,8 @@ export async function handleProfilePrompt(session, text, userId, chatId, lang, a
     });
   }
 
-  await clearAdminSession(userId);
+  const cleared = await clearAdminSession(userId, session);
+  if ((cleared?.rowsAffected ?? 0) !== 1) return false;
   const client = (api && typeof api.setMyName === 'function') ? api : tgApi;
 
   if (action === 'bprof_waiting_name' || action === 'profile_name') {

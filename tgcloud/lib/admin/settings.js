@@ -12,6 +12,7 @@ import {
   handleSettingsCallback as handlePanelCallback
 } from './settings_panel.js';
 import { registerStorageChannel } from '../services/storage_channel.js';
+import { setStorageSnapshot } from '../shared/config.js';
 import {
   SUPPORTED_FILE_MEDIA_TYPES,
   getAllowedMediaTypes,
@@ -185,11 +186,6 @@ export async function handleSettingsCallback(data, cq, userId, chatId, messageId
           parse_mode: 'HTML',
         });
       } catch (err) {
-        if (actualDb && typeof actualDb.prepare === 'function') {
-          try {
-            await actualDb.prepare("update system_config set value = 'false' where key = 'premium_emojis_enabled'").run();
-          } catch (_) {}
-        }
         await setConfig('premium_emojis_enabled', 'false');
 
         const errDesc = String(err?.description || err?.message || '');
@@ -234,11 +230,6 @@ export async function handleSettingsCallback(data, cq, userId, chatId, messageId
         testMsg.entities.some(ent => ent.type === 'custom_emoji');
 
       if (!hasCustomEmoji) {
-        if (actualDb && typeof actualDb.prepare === 'function') {
-          try {
-            await actualDb.prepare("update system_config set value = 'false' where key = 'premium_emojis_enabled'").run();
-          } catch (_) {}
-        }
         await setConfig('premium_emojis_enabled', 'false');
 
         if (cq) {
@@ -255,11 +246,6 @@ export async function handleSettingsCallback(data, cq, userId, chatId, messageId
         return true;
       }
 
-      if (actualDb && typeof actualDb.prepare === 'function') {
-        try {
-          await actualDb.prepare("insert into system_config (key, value) values ('premium_emojis_enabled', 'true') on conflict(key) do update set value = 'true'").run();
-        } catch (_) {}
-      }
       await setConfig('premium_emojis_enabled', 'true');
 
       if (cq) {
@@ -276,11 +262,6 @@ export async function handleSettingsCallback(data, cq, userId, chatId, messageId
       await renderSettingsPanel(chatId, messageId, actualDb, lang, actualApi, effectiveUserLevel);
       return true;
     } else {
-      if (actualDb && typeof actualDb.prepare === 'function') {
-        try {
-          await actualDb.prepare("update system_config set value = 'false' where key = 'premium_emojis_enabled'").run();
-        } catch (_) {}
-      }
       await setConfig('premium_emojis_enabled', 'false');
 
       if (cq) {
@@ -392,8 +373,7 @@ export async function handleSettingsCommand(cmd, arg, message, userId, chatId, l
     if (!arg) return sendMsg(chatId, t(lang, 'setstoragechannel_usage'));
     const norm = arg.trim().toLowerCase();
     if (norm === 'off' || norm === 'clear' || norm === 'disable') {
-      await setConfig('storage_channel_id', '');
-      await setConfig('storage_channel_active', 'false');
+      await setStorageSnapshot({ channel_id: '', enabled: false });
       return sendMsg(chatId, t(lang, 'storagechannel_cleared'));
     }
     const chId = arg.trim();
@@ -416,10 +396,7 @@ export async function handleSettingsCommand(cmd, arg, message, userId, chatId, l
   if (cmd === '/setdailylimit' || cmd === '/setfilelimit' || cmd === '/setautodel' || cmd === '/setbundlettl') {
     const n = Number(arg?.trim());
     if (!arg || !Number.isInteger(n) || n < 0) {
-      if (cmd === '/setdailylimit') return sendMsg(chatId, t(lang, 'daily_limit_updated', { val: formatDailyCap(0, lang) }));
-      if (cmd === '/setfilelimit') return sendMsg(chatId, t(lang, 'file_limit_updated', { val: LIMITS.DEFAULT_FILE_DAILY_LIMIT }));
-      if (cmd === '/setautodel') return sendMsg(chatId, t(lang, 'autodel_timer_updated', { val: '0' }));
-      return sendMsg(chatId, t(lang, 'bundle_ttl_updated_msg', { val: '0' }));
+      return sendMsg(chatId, t(lang, 'settings_usage_numeric', { cmd }));
     }
     if (cmd === '/setdailylimit') {
       await setConfig('daily_download_cap', String(n));
@@ -427,7 +404,7 @@ export async function handleSettingsCommand(cmd, arg, message, userId, chatId, l
     }
     if (cmd === '/setfilelimit') {
       await setConfig('file_daily_limit', String(n));
-      return sendMsg(chatId, t(lang, 'file_limit_updated', { val: n || LIMITS.DEFAULT_FILE_DAILY_LIMIT }));
+      return sendMsg(chatId, t(lang, 'file_limit_updated', { val: n === 0 ? formatDailyCap(0, lang) : n }));
     }
     if (cmd === '/setautodel') {
       await setConfig('auto_delete_seconds', String(n));

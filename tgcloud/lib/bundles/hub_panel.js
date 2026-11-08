@@ -1,13 +1,13 @@
 import { db } from 'sdk';
-import { eq, and } from 'sdk/db';
-import { adminSessions } from '../../schema.js';
 import {
   ACTIONS, LIMITS, getBotUsername, escapeHtml, truncateText,
-  sendMsg, editMsg, parseItems, nowSec, getBundle, answerCq
+  sendMsg, editMsg, parseItems, getBundle, answerCq, nowSec
 } from '../helpers.js';
 import { t } from '../locales/index.js';
-import { getManagedBundle } from './permissions.js';
-import { e, btnIcon, isPremiumEmojiEnabled } from '../shared/emojis.js';
+import { getManagedBundleFresh } from './permissions.js';
+import { getAdminSession, clearAdminSession } from '../shared/sessions.js';
+import { startEditSession } from '../filestore/upload_state.js';
+import { e, btnIcon, isPremiumEmojiEnabled, applyEmojis } from '../shared/emojis.js';
 
 export function buildBundleHubKeyboard(lang, code, opts = {}) {
   const isPremium = Boolean(opts.isPremium);
@@ -37,7 +37,6 @@ export function buildBundleHubKeyboard(lang, code, opts = {}) {
         btn(t(lang, opts.isOneTime ? 'hub_btn_onetime_on' : 'hub_btn_onetime_off'), `${ACTIONS.BUNDLE_ONETIME}${code}`, 'bundle')
       ],
       [
-        btn(t(lang, opts.hasPasscode ? 'hub_btn_pass_set' : 'hub_btn_pass_unset'), `${ACTIONS.BUNDLE_PASS_PROMPT}${code}`, 'lock'),
         btn(t(lang, 'hub_btn_post_channel'), `${ACTIONS.BUNDLE_POST_CHANNEL}${code}`, 'settings')
       ],
       [
@@ -91,7 +90,7 @@ export async function renderHub(chatId, messageId, code, lang, role, userId, edi
 
   let header = t(lang, 'hub_title');
   if (isPremium) {
-    header = header.replace('🎛', e('settings', isPremium));
+    header = header.replace('🎛', '⚙️');
   }
 
   let text = header +
@@ -100,35 +99,22 @@ export async function renderHub(chatId, messageId, code, lang, role, userId, edi
     t(lang, 'hub_owner_locked', { status: row.owner_locked ? t(lang, 'status_active_red') : t(lang, 'status_inactive_green') }) +
     t(lang, 'hub_expires_at', { time: expiryLabel }) +
     t(lang, 'hub_is_one_time', { status: row.is_one_time ? t(lang, 'status_active_red') : t(lang, 'status_inactive_green') }) +
-    t(lang, 'hub_passcode', { status: row.passcode_hash ? t(lang, 'status_enabled_shield') : t(lang, 'label_disabled') }) +
     (row.post_channel_id ? t(lang, 'hub_channel_post', { channel: escapeHtml(row.post_channel_id), interval: row.rotate_interval_sec ? `${row.rotate_interval_sec / 3600}h` : t(lang, 'label_disabled') }) : '') +
     t(lang, 'hub_search_name', { title: row.title ? escapeHtml(row.title) : t(lang, 'hub_search_none') }) +
     t(lang, 'hub_files_count', { total: items.length, max: LIMITS.MAX_BUNDLE_ITEMS });
 
   if (items.length > 0) {
-    text += formatBundleItemList(items, isPremium, 5);
+    text += formatBundleItemList(items, false, 5);
   }
 
   text += t(lang, 'hub_share_link', { link: shareLink });
-
-  if (isPremium) {
-    text = text
-      .replaceAll('🔒', e('lock', isPremium))
-      .replaceAll('🔓', e('unlocked', isPremium))
-      .replaceAll('📦', e('bundle', isPremium))
-      .replaceAll('📁', e('folder', isPremium))
-      .replaceAll('⚙️', e('settings', isPremium))
-      .replaceAll('🔍', e('search', isPremium))
-      .replaceAll('📥', e('download', isPremium))
-      .replaceAll('⚠️', e('warning', isPremium));
-  }
+  text = applyEmojis(text, isPremium);
 
   const kb = buildBundleHubKeyboard(lang, row.code, {
     isProtected: Boolean(row.protect_content),
     isOwnerLocked: Boolean(row.owner_locked),
     expiryLabel,
     isOneTime: Boolean(row.is_one_time),
-    hasPasscode: Boolean(row.passcode_hash),
     rotateIntLabel: row.rotate_interval_sec ? `${row.rotate_interval_sec / 3600}h` : undefined,
     isPremium,
   });
@@ -143,26 +129,10 @@ export async function handleHubCommand(cmd, arg, chatId, userId, lang, role) {
   if (cmd === '/edit' || cmd === '/manage') {
     if (!arg) return sendMsg(chatId, t(lang, 'review_usage'));
     const code = arg.replace(/^(?:https?:\/\/)?t\.me\/[a-zA-Z0-9_]+\?start=/, '').split('_')[0];
-    const { row, allowed } = await getManagedBundle(code, role, userId);
+    const { row, allowed } = await getManagedBundleFresh(code, userId);
     if (!row) return sendMsg(chatId, t(lang, 'bundle_not_found'));
     if (!allowed) return sendMsg(chatId, t(lang, 'bundle_access_denied'));
-    const now = nowSec();
-    const serializedItems = typeof row.items === 'string' ? row.items : JSON.stringify(row.items || []);
-    await db.insert(adminSessions).values({
-      admin_id: Number(userId),
-      code,
-      mode: 'edit',
-      items: serializedItems,
-      updated_at: now,
-    }).onConflictDoUpdate({
-      target: adminSessions.admin_id,
-      set: {
-        code,
-        mode: 'edit',
-        items: serializedItems,
-        updated_at: now,
-      },
-    }).run();
+    if (!await startEditSession(userId, row)) return sendMsg(chatId, t(lang, 'operation_cancelled'));
     return renderHub(chatId, null, code, lang, role, userId, false);
   }
 }
@@ -171,9 +141,10 @@ export async function handleHubCallback(data, cq, userId, chatId, messageId, lan
   if (data.startsWith(ACTIONS.MANAGE_HUB)) {
     await answerCq(cq);
     const code = data.slice(ACTIONS.MANAGE_HUB.length);
-    const { row, allowed } = await getManagedBundle(code, role, userId);
+    const { row, allowed } = await getManagedBundleFresh(code, userId);
     if (allowed) {
-      await db.delete(adminSessions).where(and(eq(adminSessions.admin_id, Number(userId)), eq(adminSessions.mode, 'edit'))).run();
+      const session = await getAdminSession(userId);
+      if (session?.mode === 'edit' && session.code === code) await clearAdminSession(userId, session);
       return renderHub(chatId, messageId, code, lang, role, userId, true);
     }
   }

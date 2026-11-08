@@ -1,6 +1,7 @@
 import { handleForceJoinCallback } from '../force_join/handlers.js';
 import { handleForceJoinCommand, handleForceJoinPrompt } from '../force_join/wizards.js';
 import { handleOwnerCommand } from './owner.js';
+import { handleOwnerCallback } from './ownership_transfer.js';
 import { handleMembersCommand, handleMembersPrompt } from './members.js';
 import { handleMembersCallback } from './members_panel.js';
 import { handleSettingsCommand, handleSettingsCallback } from './settings.js';
@@ -9,6 +10,12 @@ import { handleBotProfileCommand, handleProfilePrompt } from './profile.js';
 import { handleStatsCommand } from './stats.js';
 import { handleMaintenanceCommand, handleMaintenanceCallback } from './maintenance.js';
 import { ACTIONS, answerCq, clearAdminSession } from '../helpers.js';
+import {
+  getActiveConfig,
+  exportConfigJson,
+  importConfigJson,
+  invalidateConfigCache,
+} from '../shared/config_service.js';
 
 export async function handleAdminCommand(cmd, arg, message, userId, chatId, lang, role, ctx) {
   const fjHandled = await handleForceJoinCommand(cmd, arg, message, userId, chatId, lang, role, ctx);
@@ -47,6 +54,9 @@ export async function handleAdminCallback(data, cq, userId, chatId, messageId, l
     return true;
   }
 
+  const ownerCbHandled = await handleOwnerCallback(data, cq, userId, chatId, messageId, lang, role, ctx);
+  if (ownerCbHandled) return ownerCbHandled;
+
   const memHandled = await handleMembersCallback(data, cq, userId, chatId, messageId, lang, role, ctx);
   if (memHandled) return memHandled;
 
@@ -70,12 +80,13 @@ export async function handleAdminPrompt(session, text, userId, chatId, lang) {
     return handleMembersPrompt(session, text, userId, chatId, lang);
   }
 
-  await clearAdminSession(userId);
+  await clearAdminSession(userId, session);
   return false;
 }
 
 export {
   handleOwnerCommand,
+  handleOwnerCallback,
   handleMembersCommand,
   handleMembersCallback,
   handleMembersPrompt,
@@ -88,4 +99,9 @@ export {
   handleStatsCommand,
   handleMaintenanceCommand,
   handleMaintenanceCallback,
+  getActiveConfig,
+  exportConfigJson,
+  importConfigJson,
+  invalidateConfigCache,
 };
+

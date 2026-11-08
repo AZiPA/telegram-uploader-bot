@@ -10,7 +10,8 @@ export {
 } from 'sdk/db';
 export {
   admins, systemConfig, bundles, adminSessions, userSessions,
-  vips, userQuotas, userDownloads, forceChannels, bundleVotes, deletionQueue
+  vips, userQuotas, userDownloads, forceChannels, bundleVotes, deletionQueue,
+  botConfig
 } from '../schema.js';
 
 // ============================================================================
@@ -27,7 +28,8 @@ export { LIMITS, ACTIONS, DEFAULT_LANGUAGE } from './shared/constants.js';
 // ============================================================================
 import { escapeHtml } from './shared/formatters.js';
 export {
-  escapeHtml, truncateText, formatAutoDelete, formatBundleTtl, formatDailyCap
+  escapeHtml, truncateText, formatAutoDelete, formatBundleTtl, formatDailyCap,
+  splitStandardMessage, splitRichMessage, splitHtmlPreservingTags
 } from './shared/formatters.js';
 
 export function safeSliceEscape(str = '', max = 64) {
@@ -41,8 +43,7 @@ export function safeSliceEscape(str = '', max = 64) {
 // ============================================================================
 export {
   sha256Hex, generateCode, generateBase62Code, generateProtectedCode,
-  generateBundleCode, BUNDLE_CODE_REGEX, isValidBundleCode,
-  hashBundlePin, verifyBundlePin
+  generateBundleCode, BUNDLE_CODE_REGEX, isValidBundleCode
 } from './shared/crypto.js';
 
 // ============================================================================
@@ -51,7 +52,7 @@ export {
 // Used by: all command handlers, wizards, panels, and delivery flows
 // ============================================================================
 export {
-  tgApi, buildForceReply, sendMsg, editMsg, editMarkup, answerCq,
+  tgApi, defaultTgApi, buildForceReply, sendMsg, sendSplitMsg, editMsg, editMarkup, answerCq,
   stripCustomEmojiTags, isCustomEmojiError
 } from './shared/telegram.js';
 
@@ -75,6 +76,9 @@ strikeMap.set = function (key, timestamp) {
 export {
   nowSec, parseItems, configCache, getConfig, setConfig, getBotUsername
 } from './shared/config.js';
+export {
+  getActiveConfig, exportConfigJson, importConfigJson, invalidateConfigCache
+} from './shared/config_service.js';
 export { sendLogAlert } from './services/log_channel.js';
 
 // ============================================================================
@@ -87,11 +91,24 @@ export {
 } from './middlewares/auth.js';
 
 // ============================================================================
-// # SECTION: SESSIONS, PASSCODES & BUNDLE ACCESS
-// Admin prompt tracking, user PIN strikes/lockouts, and bundle ownership check
+// # SECTION: BOT OWNERSHIP LIFECYCLE
+// Zero-state bootstrap and two-step ownership transfer
+// Used by: handlers, router, and admin operational flow
+// ============================================================================
+export {
+  handleZeroStateClaim
+} from './admin/ownership_bootstrap.js';
+export {
+  initiateOwnershipTransfer, confirmOwnershipTransfer,
+  cancelOwnershipTransfer, handleOwnerCallback
+} from './admin/ownership_transfer.js';
+
+// ============================================================================
+// # SECTION: SESSIONS & BUNDLE ACCESS
+// Admin prompt tracking and bundle ownership check
 // Used by: filestore, delivery, bundles, and admin controllers
 // ============================================================================
 export {
   clearAdminSession, clearUserSession, setAdminPrompt, getAdminSession, getBundle, canManageBundle,
-  recordPinFailure, resetPinStrikes, isUserPinLockedOut, grantBundleAccess, hasBundleAccessGrant
+  replaceAdminSession, updateAdminSession, sessionFence, sessionIdentityActive, rebindAdminSessions
 } from './shared/sessions.js';

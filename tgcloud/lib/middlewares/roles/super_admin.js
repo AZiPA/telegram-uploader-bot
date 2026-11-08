@@ -1,7 +1,6 @@
 export const SUPER_ADMIN_COMMANDS = {
   '/addadmin': 3,
   '/deladmin': 3,
-  '/setstoragechannel': 3,
   '/setlogchannel': 3,
   '/botprofile': 3,
 };

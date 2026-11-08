@@ -2,9 +2,16 @@ import { api, db } from 'sdk';
 import { systemConfig } from '../../schema.js';
 import { setConfig, configCache } from './config.js';
 import { notifyCustomEmojiDisabled } from '../services/log_channel.js';
+import { splitStandardMessage, splitRichMessage } from './formatters.js';
 
 export const tgApi = {
   sendMessage: (p) => api.sendMessage(p),
+  sendRichMessage: (p) => {
+    const richPayload = typeof p.rich_message === 'object' && p.rich_message !== null
+      ? p.rich_message
+      : { html: String(p.rich_message || p.text || '') };
+    return api.sendRichMessage({ chat_id: p.chat_id, rich_message: richPayload, ...p });
+  },
   editMessageText: (p) => api.editMessageText(p),
   editMessageReplyMarkup: (p) => api.editMessageReplyMarkup(p),
   answerCallbackQuery: (p) => api.answerCallbackQuery(p),
@@ -16,6 +23,10 @@ export const tgApi = {
   sendVideo: (p) => api.sendVideo(p),
   sendAudio: (p) => api.sendAudio(p),
   sendPhoto: (p) => api.sendPhoto(p),
+  sendVoice: (p) => api.sendVoice(p),
+  sendVideoNote: (p) => api.sendVideoNote(p),
+  sendAnimation: (p) => api.sendAnimation(p),
+  sendSticker: (p) => api.sendSticker(p),
   getChat: (p) => api.getChat(p),
   getChatMember: (p) => api.getChatMember(p),
   createChatInviteLink: (p) => api.createChatInviteLink(p),
@@ -46,6 +57,23 @@ export function stripCustomEmojiTags(html) {
   if (!html || typeof html !== 'string') return html;
   // Replaces <tg-emoji emoji-id="...">FALLBACK</tg-emoji> with just FALLBACK
   return html.replace(/<tg-emoji[^>]*>(.*?)<\/tg-emoji>/gi, '$1');
+}
+
+export function stripCustomEmojiFromMarkup(markup) {
+  if (!markup || typeof markup !== 'object') return markup;
+  const cloned = JSON.parse(JSON.stringify(markup));
+  if (Array.isArray(cloned.inline_keyboard)) {
+    for (const row of cloned.inline_keyboard) {
+      if (Array.isArray(row)) {
+        for (const btn of row) {
+          if (btn && 'icon_custom_emoji_id' in btn) {
+            delete btn.icon_custom_emoji_id;
+          }
+        }
+      }
+    }
+  }
+  return cloned;
 }
 
 export function isCustomEmojiError(err) {
@@ -87,8 +115,10 @@ export async function handleCustomEmojiCircuitBreaker() {
   }
 }
 
+export const defaultTgApi = tgApi;
+
 export async function sendMsg(chatId, text, replyMarkup = null, extra = {}) {
-  const isMarkupObj = replyMarkup && typeof replyMarkup === 'object' && !Array.isArray(replyMarkup) && ('reply_markup' in replyMarkup || 'parse_mode' in replyMarkup);
+  const isMarkupObj = replyMarkup && typeof replyMarkup === 'object' && !Array.isArray(replyMarkup) && ('reply_markup' in replyMarkup || 'parse_mode' in replyMarkup || Object.keys(replyMarkup).length === 0);
   const payload = isMarkupObj
     ? {
         chat_id: chatId,
@@ -110,13 +140,50 @@ export async function sendMsg(chatId, text, replyMarkup = null, extra = {}) {
     if (isCustomEmojiError(err)) {
       await handleCustomEmojiCircuitBreaker();
       const cleanText = stripCustomEmojiTags(text);
-      return await tgApi.sendMessage({
+      const cleanPayload = {
         ...payload,
         text: cleanText,
-      });
+      };
+      if (cleanPayload.reply_markup) {
+        cleanPayload.reply_markup = stripCustomEmojiFromMarkup(cleanPayload.reply_markup);
+      }
+      return await tgApi.sendMessage(cleanPayload);
     }
     throw err;
   }
+}
+
+export async function sendSplitMsg(chatId, text, opts = {}, isRich = false) {
+  if (isRich) {
+    const chunks = splitRichMessage(text, 32000);
+    const results = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const res = await defaultTgApi.sendRichMessage({
+        chat_id: chatId,
+        rich_message: { html: chunks[i] },
+        ...(i === chunks.length - 1 ? opts : {})
+      });
+      results.push(res);
+    }
+    return results;
+  }
+
+  const chunks = splitStandardMessage(text, 4000);
+  const results = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkOpts = {
+      parse_mode: 'HTML',
+      ...opts,
+    };
+    if (i === chunks.length - 1 && opts.reply_markup) {
+      chunkOpts.reply_markup = opts.reply_markup;
+    } else {
+      delete chunkOpts.reply_markup;
+    }
+    const res = await sendMsg(chatId, chunks[i], chunkOpts);
+    results.push(res);
+  }
+  return results;
 }
 
 export async function editMsg(chatId, messageId, text, replyMarkup = null, fallbackToSend = false) {
@@ -141,13 +208,17 @@ export async function editMsg(chatId, messageId, text, replyMarkup = null, fallb
     if (isCustomEmojiError(err)) {
       await handleCustomEmojiCircuitBreaker();
       const cleanText = stripCustomEmojiTags(text);
+      const cleanOpts = { ...opts };
+      if (cleanOpts.reply_markup) {
+        cleanOpts.reply_markup = stripCustomEmojiFromMarkup(cleanOpts.reply_markup);
+      }
       try {
         return await tgApi.editMessageText({
           chat_id: chatId,
           message_id: messageId,
           text: cleanText,
           parse_mode: 'HTML',
-          ...opts,
+          ...cleanOpts,
         });
       } catch (retryErr) {
         const retryDesc = String(retryErr?.description || retryErr?.message || '');
@@ -155,7 +226,7 @@ export async function editMsg(chatId, messageId, text, replyMarkup = null, fallb
           return null;
         }
         if (fallbackToSend) {
-          return sendMsg(chatId, cleanText, replyMarkup);
+          return sendMsg(chatId, cleanText, cleanOpts.reply_markup || replyMarkup);
         }
         throw retryErr;
       }

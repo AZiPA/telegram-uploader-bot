@@ -1,12 +1,22 @@
 import { db } from 'sdk';
 import { eq, and } from 'sdk/db';
-import { adminSessions, bundles } from '../../schema.js';
+import { bundles, uploadSessions } from '../../schema.js';
 import {
   ACTIONS, LIMITS, escapeHtml, truncateText,
-  sendMsg, editMsg, answerCq, parseItems, nowSec, getBundle
+  sendMsg, editMsg, answerCq, parseItems, nowSec
 } from '../helpers.js';
 import { t } from '../locales/index.js';
-import { getManagedBundle } from './permissions.js';
+import { getManagedBundleFresh, bundleMutationGuard } from './permissions.js';
+import { clearExpiredAdminSession, getAdminSession, updateAdminSession, sessionIdentityActive } from '../shared/sessions.js';
+import { sortUploadItems, startEditSession, getUploadOperation } from '../filestore/upload_state.js';
+import { recoverBundleMirrorReceipts } from '../filestore/upload_mirror.js';
+import { ensureBundleIdentity } from './lifecycle.js';
+
+async function recoverReviewReceipts(bundle) {
+  try { await recoverBundleMirrorReceipts(bundle.upload_session_id); } catch (error) {
+    console.warn('Optional mirror receipt projection deferred:', error?.message || error);
+  }
+}
 
 export function buildReviewKeyboard(lang, code, items = []) {
   const rows = [];
@@ -41,28 +51,24 @@ export async function renderReview(chatId, messageId, code, lang, role, userId, 
     messageId = legacyEditId || null;
     edit = Boolean(messageId);
   }
-  const row = await getBundle(code);
-  if (!row) return sendMsg(chatId, t(lang, 'bundle_not_found'));
+  let { row, allowed } = await getManagedBundleFresh(code, userId);
+  if (!row || !allowed) return sendMsg(chatId, t(lang, 'bundle_access_denied'));
 
   if (userId) {
     const adminId = Number(userId);
-    const now = nowSec();
-    const serializedItems = typeof row.items === 'string' ? row.items : JSON.stringify(row.items || []);
-    await db.insert(adminSessions).values({
-      admin_id: adminId,
-      code: row.code,
-      mode: 'edit',
-      items: serializedItems,
-      updated_at: now,
-    }).onConflictDoUpdate({
-      target: adminSessions.admin_id,
-      set: {
-        code: row.code,
-        mode: 'edit',
-        items: serializedItems,
-        updated_at: now,
-      },
-    }).run();
+    const existingSess = await getAdminSession(adminId);
+    const uploading = existingSess?.state === 'active' && ['batch', 'upload'].includes(existingSess.mode);
+    const operation = uploading && existingSess.session_id
+      ? await db.select().from(uploadSessions).where(eq(uploadSessions.id, existingSess.session_id)).get() : null;
+    const isMidUpload = uploading && (!operation || operation.state === 'open');
+    const editingSame = existingSess?.state === 'active' && existingSess.mode === 'edit' && existingSess.code === code;
+    if (!isMidUpload && !editingSame) {
+      const freshAccess = await getManagedBundleFresh(code, userId);
+      if (!freshAccess.allowed) return sendMsg(chatId, t(lang, 'bundle_access_denied'));
+      row = freshAccess.row;
+      const replaced = await startEditSession(adminId, row, existingSess);
+      if (!replaced) return sendMsg(chatId, t(lang, 'operation_cancelled'));
+    }
   }
 
   const items = parseItems(row.items);
@@ -89,45 +95,53 @@ export async function renderReview(chatId, messageId, code, lang, role, userId, 
 export async function handleReviewCommand(cmd, arg, chatId, userId, lang, role) {
   if (cmd === '/review') {
     if (!arg) return sendMsg(chatId, t(lang, 'review_usage'));
-    const { row, allowed } = await getManagedBundle(arg, role, userId);
+    const { row, allowed } = await getManagedBundleFresh(arg, userId);
     if (!row || !allowed) return sendMsg(chatId, t(lang, 'bundle_access_denied'));
     return renderReview(chatId, null, arg, lang, role, userId, false);
   }
   if (cmd.startsWith('/del_')) {
     const idx = Number(cmd.slice(5)) - 1;
     const now = nowSec();
-    const s = await db.select().from(adminSessions).where(and(eq(adminSessions.admin_id, Number(userId)), eq(adminSessions.mode, 'edit'))).get();
+    let s = await getAdminSession(userId);
+    if (!s || s.mode !== 'edit' || s.state !== 'active') return sendMsg(chatId, t(lang, 'operation_cancelled'));
     if (s && (now - (s.updated_at || 0) > 600)) {
-      await db.delete(adminSessions).where(eq(adminSessions.admin_id, Number(userId))).run();
-      return sendMsg(chatId, t(lang, 'operation_cancelled'));
+      const expired = await clearExpiredAdminSession(s, now - 600);
+      if (expired.rowsAffected === 1) return sendMsg(chatId, t(lang, 'operation_cancelled'));
     }
-    if (s && idx >= 0) {
-      const items = parseItems(s.items);
-      if (items[idx]) {
-        items.splice(idx, 1);
-        items.sort((a, b) => {
-          const sA = Number(a.source_message_id || 0);
-          const sB = Number(b.source_message_id || 0);
-          if (sA > 0 && sB > 0) return sA - sB;
-          return 0;
-        });
-        const b = await db.select({ items: bundles.items }).from(bundles).where(eq(bundles.code, s.code)).get();
-        if (b) {
-          const casRes = await db.update(bundles)
-            .set({ items })
-            .where(and(eq(bundles.code, s.code), eq(bundles.items, b.items)))
-            .run();
-          const affected = casRes?.rowsAffected ?? 0;
-          if (affected !== 1) {
-            return sendMsg(chatId, t(lang, 'bundle_save_error'));
-          }
-        }
-        await db.update(adminSessions)
-          .set({ items: typeof items === 'string' ? items : JSON.stringify(items), updated_at: now })
-          .where(eq(adminSessions.admin_id, Number(userId)))
-          .run();
-        return renderReview(chatId, null, s.code, lang, role, userId, false);
+    if (Number.isInteger(idx) && idx >= 0 && idx < LIMITS.MAX_BUNDLE_ITEMS) {
+      const access = await getManagedBundleFresh(s.code, userId);
+      if (!access.allowed) return sendMsg(chatId, t(lang, 'bundle_access_denied'));
+      if (!s.session_id || !s.generation) {
+        s = await updateAdminSession(s, { session_id: crypto.randomUUID(), generation: crypto.randomUUID() });
+        if (!s) return sendMsg(chatId, t(lang, 'operation_cancelled'));
       }
+      let operation;
+      try { operation = await getUploadOperation(s); } catch (error) {
+        if (!['UPLOAD_SESSION_CHANGED', 'UPLOAD_ACCESS_DENIED'].includes(error?.message)) throw error;
+        return sendMsg(chatId, t(lang, 'operation_cancelled'));
+      }
+      if (access.row.upload_session_id && access.row.upload_session_id !== operation.bundle_id) return sendMsg(chatId, t(lang, 'bundle_access_denied'));
+      await recoverReviewReceipts(access.row);
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const { row: b, allowed } = await getManagedBundleFresh(s.code, userId);
+        if (!b || !allowed || b.upload_session_id !== operation.bundle_id) return sendMsg(chatId, t(lang, 'bundle_access_denied'));
+        const current = parseItems(b.items);
+        if (!current[idx]) {
+          return sendMsg(chatId, t(lang, 'review_stale_list'));
+        }
+        const next = sortUploadItems(current.filter((_, i) => i !== idx));
+        const casRes = await db.update(bundles)
+          .set({ items: next, removed_item_ids: removedItems(b, current[idx]) })
+          .where(and(eq(bundles.code, s.code), eq(bundles.upload_session_id, operation.bundle_id), eq(bundles.items, b.items),
+            eq(bundles.removed_item_ids, b.removed_item_ids), bundleMutationGuard(userId), sessionIdentityActive(s)))
+          .run();
+        const affected = casRes?.rowsAffected ?? 0;
+        if (affected === 1) {
+          await updateAdminSession(s, { items: next });
+          return renderReview(chatId, null, s.code, lang, role, userId, false);
+        }
+      }
+      return sendMsg(chatId, t(lang, 'bundle_save_error'));
     }
   }
 }
@@ -136,7 +150,7 @@ export async function handleReviewCallback(data, cq, userId, chatId, messageId, 
   if (data.startsWith('mng:review:')) {
     await answerCq(cq);
     const code = data.slice('mng:review:'.length);
-    const { row, allowed } = await getManagedBundle(code, role, userId);
+    const { allowed } = await getManagedBundleFresh(code, userId);
     if (allowed) return renderReview(chatId, messageId, code, lang, role, userId, true);
   }
   if (data.startsWith(ACTIONS.MANAGE_REFRESH)) {
@@ -145,29 +159,39 @@ export async function handleReviewCallback(data, cq, userId, chatId, messageId, 
     return renderReview(chatId, messageId, code, lang, role, userId, true);
   }
   if (data.startsWith(ACTIONS.MANAGE_DEL_ITEM)) {
-    const [, , idxStr, , code] = data.split(':');
+    await answerCq(cq);
+    const [, , idxStr, uid, code] = data.split(':');
     const idx = Number(idxStr);
-    const { row, allowed } = await getManagedBundle(code, role, userId);
+    if (!/^\d+$/.test(idxStr || '') || !Number.isInteger(idx) || idx < 0 || idx >= LIMITS.MAX_BUNDLE_ITEMS) return true;
+    let { row, allowed } = await getManagedBundleFresh(code, userId);
     if (row && allowed) {
+      row = await ensureBundleIdentity(row);
+      if (!row) return sendMsg(chatId, t(lang, 'operation_cancelled'));
+      const bundleId = row.upload_session_id;
+      await recoverReviewReceipts(row);
+      ({ row, allowed } = await getManagedBundleFresh(code, userId));
+      if (!row || !allowed || row.upload_session_id !== bundleId) return sendMsg(chatId, t(lang, 'bundle_access_denied'));
       const items = parseItems(row.items);
-      if (items[idx]) {
-        items.splice(idx, 1);
-        items.sort((a, b) => {
-          const sA = Number(a.source_message_id || 0);
-          const sB = Number(b.source_message_id || 0);
-          if (sA > 0 && sB > 0) return sA - sB;
-          return 0;
-        });
-        const casRes = await db.update(bundles)
-          .set({ items })
-          .where(and(eq(bundles.code, code), eq(bundles.items, row.items)))
-          .run();
-        const affected = casRes?.rowsAffected ?? 0;
-        if (affected !== 1) {
-          return answerCq(cq, t(lang, 'bundle_save_error'), true);
-        }
+      if (!items[idx] || (items[idx].file_unique_id || 'item').slice(0, 8) !== uid) {
+        await sendMsg(chatId, t(lang, 'review_stale_list'));
         return renderReview(chatId, messageId, code, lang, role, userId, true);
       }
+      const next = sortUploadItems(items.filter((_, i) => i !== idx));
+      const casRes = await db.update(bundles)
+        .set({ items: next, removed_item_ids: removedItems(row, items[idx]) })
+        .where(and(eq(bundles.code, code), eq(bundles.upload_session_id, bundleId), eq(bundles.items, row.items),
+          eq(bundles.removed_item_ids, row.removed_item_ids), bundleMutationGuard(userId)))
+        .run();
+      const affected = casRes?.rowsAffected ?? 0;
+      if (affected !== 1) {
+        return sendMsg(chatId, t(lang, 'bundle_save_error'));
+      }
+      return renderReview(chatId, messageId, code, lang, role, userId, true);
     }
   }
+}
+
+function removedItems(bundle, removed) {
+  const existing = parseItems(bundle.removed_item_ids);
+  return removed.item_id ? [...new Set([...existing, removed.item_id])] : existing;
 }

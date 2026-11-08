@@ -7,27 +7,28 @@ import {
 import { renderForceJoinAdminPanel } from './panel.js';
 import { t } from '../locales/index.js';
 
-export async function handleChatMember(payload) {
-  const chatMember = payload?.chat_member || payload?.my_chat_member || payload;
+export async function handleChatMember(payload, isMyChatMember = false) {
+  const isMy = isMyChatMember || Boolean(payload?.my_chat_member);
+  const chatMember = payload?.my_chat_member || payload?.chat_member || payload;
   const chId = chatMember?.chat?.id ? String(chatMember.chat.id) : null;
   if (!chId) return false;
 
-  const newStatus = chatMember?.new_chat_member?.status;
-  if (newStatus === 'kicked' || newStatus === 'left') {
-    await db.delete(forceChannels).where(eq(forceChannels.channel_id, chId)).run();
-    return true;
+  // Only deactivate on my_chat_member status 'kicked' or 'left', never on regular user chat_member leaves!
+  if (isMy) {
+    const newStatus = chatMember?.new_chat_member?.status;
+    if (newStatus === 'kicked' || newStatus === 'left') {
+      await db.update(forceChannels).set({ is_active: false }).where(eq(forceChannels.channel_id, chId)).run();
+      return true;
+    }
   }
 
   const inviteLink = chatMember.invite_link;
   if (!inviteLink) return false;
 
-  const isSaturated = Boolean(
-    inviteLink.is_revoked ||
-    (inviteLink.member_limit && inviteLink.member_limit > 0 && inviteLink.is_revoked)
-  );
+  const isSaturated = Boolean(inviteLink.is_revoked);
 
   if (isSaturated) {
-    await db.delete(forceChannels).where(eq(forceChannels.channel_id, chId)).run();
+    await db.update(forceChannels).set({ is_active: false }).where(eq(forceChannels.channel_id, chId)).run();
     return true;
   }
   return false;
@@ -43,22 +44,6 @@ export async function handleForceJoinCallback(data, cq, userId, chatId, messageI
     const ch = await db.select().from(forceChannels).where(eq(forceChannels.channel_id, chId)).get();
     await answerCq(cq);
     if (ch) {
-      let isSaturated = false;
-      if (ch.invite_link) {
-        try {
-          const linkInfo = await tgApi.editChatInviteLink({ chat_id: chId, invite_link: ch.invite_link });
-          if (linkInfo?.is_revoked) isSaturated = true;
-        } catch (linkErr) {
-          const desc = String(linkErr?.description || linkErr?.message || '').toLowerCase();
-          if (desc.includes('revoked') || desc.includes('expired') || desc.includes('invalid') || desc.includes('limit') || desc.includes('capacity')) {
-            isSaturated = true;
-          }
-        }
-      }
-      if (isSaturated) {
-        await db.delete(forceChannels).where(eq(forceChannels.channel_id, chId)).run();
-        return sendMsg(chatId, t(lang, 'fj_delchannel_success'));
-      }
       return sendMsg(chatId, t(lang, 'fj_audit_body', {
         name: escapeHtml(ch.channel_name),
         limit: ch.target_limit ? String(ch.target_limit) : t(lang, 'fj_wizard_unlimited'),
@@ -89,22 +74,6 @@ export async function handleForceJoinCallback(data, cq, userId, chatId, messageI
       if (!ok) {
         await db.update(forceChannels).set({ is_active: false }).where(eq(forceChannels.channel_id, chId)).run();
         return answerCq(cq, t(lang, 'fj_recheck_not_admin'));
-      }
-      let isSaturated = false;
-      if (ch.invite_link) {
-        try {
-          const linkInfo = await tgApi.editChatInviteLink({ chat_id: chId, invite_link: ch.invite_link });
-          if (linkInfo?.is_revoked) isSaturated = true;
-        } catch (linkErr) {
-          const desc = String(linkErr?.description || linkErr?.message || '').toLowerCase();
-          if (desc.includes('revoked') || desc.includes('expired') || desc.includes('invalid') || desc.includes('limit') || desc.includes('capacity')) {
-            isSaturated = true;
-          }
-        }
-      }
-      if (isSaturated) {
-        await db.delete(forceChannels).where(eq(forceChannels.channel_id, chId)).run();
-        return answerCq(cq, t(lang, 'fj_delchannel_success'), true);
       }
       await db.update(forceChannels).set({ is_active: true }).where(eq(forceChannels.channel_id, chId)).run();
       return answerCq(cq, t(lang, 'fj_channel_reactivated'));

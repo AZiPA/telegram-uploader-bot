@@ -25,7 +25,6 @@ export const ADMIN_COMMANDS = {
   '/delchannel': 2,
   '/setchannelbtn': 2,
   '/setverifybtn': 2,
-  '/setpass': 2,
   '/setexpiry': 2,
 };
 

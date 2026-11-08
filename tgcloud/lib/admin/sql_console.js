@@ -5,69 +5,12 @@ import {
   sql,
   eq,
   adminSessions,
-  escapeHtml,
   nowSec,
   getEffectiveOwnerId
 } from '../helpers.js';
-
-/**
- * Format dynamic cell values capped at 25 characters with ellipsis.
- */
-function formatCell(val) {
-  let str;
-  if (val === null || val === undefined) {
-    str = 'NULL';
-  } else if (typeof val === 'object') {
-    str = JSON.stringify(val);
-  } else {
-    str = String(val);
-  }
-  str = str.replace(/[\r\n\t]+/g, ' ');
-  if (str.length > 25) {
-    str = str.slice(0, 22) + '...';
-  }
-  return str;
-}
-
-/**
- * Build standard ASCII grid table (+----+----+ border, dynamic column widths capped at 25 chars).
- */
-function buildAsciiTable(rows, columns = null) {
-  if (!rows || rows.length === 0) return '';
-  const cols = columns && columns.length > 0
-    ? columns
-    : Array.from(new Set(rows.flatMap(r => (r && typeof r === 'object') ? Object.keys(r) : [])));
-
-  if (cols.length === 0) return '';
-
-  const colWidths = {};
-  for (const c of cols) {
-    const headerStr = c.length > 25 ? c.slice(0, 22) + '...' : c;
-    let maxLen = headerStr.length;
-    for (const r of rows) {
-      const cellVal = formatCell(r ? r[c] : undefined);
-      if (cellVal.length > maxLen) {
-        maxLen = cellVal.length;
-      }
-    }
-    colWidths[c] = Math.min(25, maxLen);
-  }
-
-  const border = '+' + cols.map(c => '-'.repeat(colWidths[c] + 2)).join('+') + '+';
-  const header = '| ' + cols.map(c => {
-    const h = c.length > 25 ? c.slice(0, 22) + '...' : c;
-    return h.padEnd(colWidths[c]);
-  }).join(' | ') + ' |';
-
-  const rowLines = rows.map(r => {
-    return '| ' + cols.map(c => {
-      const formatted = formatCell(r ? r[c] : undefined);
-      return formatted.padEnd(colWidths[c]);
-    }).join(' | ') + ' |';
-  });
-
-  return [border, header, border, ...rowLines, border].join('\n');
-}
+import { formatNativeSqlTable, escapeHtml } from '../shared/formatters.js';
+import { sendSplitMsg } from '../shared/telegram.js';
+import { replaceAdminSession, updateAdminSession, clearAdminSession } from '../shared/sessions.js';
 
 /**
  * Classify if query is a read query.
@@ -117,83 +60,36 @@ function isExitCommand(text) {
 /**
  * Execute query and format output.
  */
-async function executeQuery(query, chatId, dbInstance, apiInstance, isTerminalMode, ownerId) {
+async function executeQuery(query, chatId, dbInstance, apiInstance, isTerminalMode, session) {
   if (isTerminalMode) {
-    await dbInstance.update(adminSessions)
-      .set({ updated_at: nowSec() })
-      .where(eq(adminSessions.admin_id, Number(ownerId)))
-      .run();
+    if (!await updateAdminSession(session, {}, dbInstance)) return;
   }
 
   const startTime = Date.now();
   try {
     if (isReadQuery(query)) {
       const rows = await dbInstance.all(sql.raw(query));
-      const ms = (Date.now() - startTime).toFixed(2);
-      if (!rows || rows.length === 0) {
-        await apiInstance.sendMessage({
-          chat_id: chatId,
-          text: `⚪️ <b>Empty set</b> (0 rows, ${ms} ms)`,
-          parse_mode: 'HTML',
-        });
+      if (Array.isArray(rows)) {
+        const total = rows.length;
+        const notice = total > 40 ? ` <i>(showing first 40 of ${total} rows)</i>` : '';
+        const tableHtml = formatNativeSqlTable(rows, 40, 40);
+
+        const fullHtml = `📊 <b>SQL Execution:</b>\n<pre><code class="language-sql">${escapeHtml(query)}</code></pre>\n\n📋 <b>Result (${total} row${total === 1 ? '' : 's'}):</b>${notice}\n${tableHtml}`;
+
+        await sendSplitMsg(chatId, fullHtml, {}, true);
         return;
       }
-
-      const asciiTable = buildAsciiTable(rows);
-      const fullText = `🟢 <b>Query OK</b> (${rows.length} rows returned, ${ms} ms)\n\n<pre><code>${escapeHtml(asciiTable)}</code></pre>`;
-
-      if (rows.length <= 15 && fullText.length <= 3500) {
-        await apiInstance.sendMessage({
-          chat_id: chatId,
-          text: fullText,
-          parse_mode: 'HTML',
-        });
-        return;
-      }
-
-      // Large dataset preview + document delivery
-      const previewRows = rows.slice(0, 10);
-      const previewTable = buildAsciiTable(previewRows);
-      const previewText = `🟢 <b>Query OK</b> (${rows.length} rows returned, ${ms} ms)\n<i>Preview of first 10 rows:</i>\n\n<pre><code>${escapeHtml(previewTable)}</code></pre>`;
-
-      await apiInstance.sendMessage({
-        chat_id: chatId,
-        text: previewText,
-        parse_mode: 'HTML',
-      });
-
-      const jsonBytes = new TextEncoder().encode(JSON.stringify(rows, null, 2));
-      try {
-        await apiInstance.sendDocument({
-          chat_id: chatId,
-          document: new InputFile(jsonBytes, 'results.json', { type: 'application/json' }),
-          caption: `Complete dataset (${rows.length} rows)`,
-        });
-      } catch (docErr) {
-        console.error('Failed to send complete dataset document:', docErr);
-      }
-      return;
     }
 
     // Mutation Query
-    const res = await dbInstance.run(sql.raw(query));
-    const ms = (Date.now() - startTime).toFixed(2);
-    const rowsAffected = res?.rowsAffected ?? 0;
-    const lastInsertRowid = res?.lastInsertRowid ?? 'N/A';
-
-    await apiInstance.sendMessage({
-      chat_id: chatId,
-      text: `🟢 <b>Query OK</b> (${ms} ms)\n• Rows Affected: <code>${rowsAffected}</code>\n• Last Insert ID: <code>${lastInsertRowid}</code>`,
-      parse_mode: 'HTML',
-    });
+    const result = await dbInstance.run(sql.raw(query));
+    const fullHtml = `📊 <b>SQL Execution:</b>\n<pre><code class="language-sql">${escapeHtml(query)}</code></pre>\n\n✅ <b>Query executed successfully.</b>\n<blockquote><code>Rows affected: ${Number(result?.rowsAffected ?? result?.changes ?? 0)}</code></blockquote>`;
+    await sendSplitMsg(chatId, fullHtml, {}, true);
   } catch (err) {
     const ms = (Date.now() - startTime).toFixed(2);
     const errMsg = err?.message || String(err);
-    await apiInstance.sendMessage({
-      chat_id: chatId,
-      text: `🔴 <b>Query ERROR</b> (${ms} ms)\n<pre><code>${escapeHtml(errMsg)}</code></pre>`,
-      parse_mode: 'HTML',
-    });
+    const fullHtml = `📊 <b>SQL Execution:</b>\n<pre><code class="language-sql">${escapeHtml(query)}</code></pre>\n\n🔴 <b>Query ERROR</b> (${ms} ms)\n<pre><code>${escapeHtml(errMsg)}</code></pre>`;
+    await sendSplitMsg(chatId, fullHtml, {}, true);
   }
 }
 
@@ -230,7 +126,7 @@ export async function handleSqlRoute(ctx, db, tgApi, ownerId) {
 
   // 1. Auto-Timeout Check (10 minutes of inactivity)
   if (isTerminalMode && (now - (session.updated_at || 0) > 600)) {
-    await dbInstance.delete(adminSessions).where(eq(adminSessions.admin_id, resolvedOwnerId)).run();
+    await clearAdminSession(resolvedOwnerId, session, dbInstance);
     if (!isEntryCommand(rawText)) {
       await apiInstance.sendMessage({
         chat_id: chatId,
@@ -243,21 +139,7 @@ export async function handleSqlRoute(ctx, db, tgApi, ownerId) {
 
   // 2. Entry Commands (/terminal, /console, or bare /sql)
   if (isEntryCommand(rawText)) {
-    await dbInstance.insert(adminSessions).values({
-      admin_id: resolvedOwnerId,
-      code: 'SQL',
-      mode: 'sql_terminal',
-      items: '[]',
-      updated_at: now,
-    }).onConflictDoUpdate({
-      target: adminSessions.admin_id,
-      set: {
-        code: 'SQL',
-        mode: 'sql_terminal',
-        items: '[]',
-        updated_at: now,
-      },
-    }).run();
+    await replaceAdminSession(resolvedOwnerId, { code: 'SQL', mode: 'sql_terminal', items: '[]' }, dbInstance);
 
     const welcomeMsg = '💻 <b>SQLite Interactive Console Connected</b>\n' +
       '• Type SQL queries directly to execute.\n' +
@@ -275,7 +157,7 @@ export async function handleSqlRoute(ctx, db, tgApi, ownerId) {
 
   // 3. Exit Commands (/exit, /quit, /q, /cancel, exit, quit, q)
   if (isExitCommand(rawText)) {
-    await dbInstance.delete(adminSessions).where(eq(adminSessions.admin_id, resolvedOwnerId)).run();
+    if (session) await clearAdminSession(resolvedOwnerId, session, dbInstance);
     await apiInstance.sendMessage({
       chat_id: chatId,
       text: '🔌 <b>SQL Console Disconnected</b>\nReturned to normal chat mode.',
@@ -294,7 +176,7 @@ export async function handleSqlRoute(ctx, db, tgApi, ownerId) {
       dbInstance,
       apiInstance,
       isTerminalMode,
-      resolvedOwnerId
+      session
     );
   }
 
@@ -305,10 +187,7 @@ export async function handleSqlRoute(ctx, db, tgApi, ownerId) {
 
     const startTime = Date.now();
     if (isTerminalMode) {
-      await dbInstance.update(adminSessions)
-        .set({ updated_at: nowSec() })
-        .where(eq(adminSessions.admin_id, resolvedOwnerId))
-        .run();
+      if (!await updateAdminSession(session, {}, dbInstance)) return;
     }
 
     if (!tableName) {
@@ -421,5 +300,5 @@ export async function handleSqlRoute(ctx, db, tgApi, ownerId) {
   const executableQuery = queryToExec.trim().replace(/;\s*$/, '');
   if (!executableQuery) return;
 
-  await executeQuery(executableQuery, chatId, dbInstance, apiInstance, isTerminalMode, resolvedOwnerId);
+  await executeQuery(executableQuery, chatId, dbInstance, apiInstance, isTerminalMode, session);
 }

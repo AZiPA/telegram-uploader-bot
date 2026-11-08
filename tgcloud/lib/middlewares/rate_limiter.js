@@ -99,6 +99,18 @@ export async function consumeDownloadQuota(userId, db = defaultDb) {
   }).run();
 }
 
+export const incrementUserQuota = consumeDownloadQuota;
+
+export async function rollbackDownloadQuota(userId, db = defaultDb) {
+  const dbInstance = (db && typeof db.update === 'function') ? db : defaultDb;
+  const numUserId = Number(userId);
+  const today = new Date().toISOString().slice(0, 10);
+
+  return await dbInstance.update(userQuotas).set({
+    downloads_today: sql`CASE WHEN last_download_date = ${today} AND downloads_today > 0 THEN downloads_today - 1 ELSE downloads_today END`,
+  }).where(eq(userQuotas.user_id, numUserId)).run();
+}
+
 export async function checkPinLockout(userId, db = defaultDb) {
   const dbInstance = (db && typeof db.select === 'function') ? db : defaultDb;
   const numUserId = Number(userId);

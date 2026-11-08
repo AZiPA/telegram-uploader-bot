@@ -63,15 +63,19 @@ export async function handleForceJoinCommand(cmd, arg, message, userId, chatId, 
     } else {
       return sendMsg(chatId, t(lang, 'fj_wizard_help'));
     }
-    const chCount = (await db.select({ c: count() }).from(forceChannels).where(eq(forceChannels.is_active, true)).get())?.c || 0;
-    if (chCount >= LIMITS.MAX_FORCE_JOIN_CHANNELS) {
-      return sendMsg(chatId, t(lang, 'fj_wizard_max_limit', { max: LIMITS.MAX_FORCE_JOIN_CHANNELS }));
+    const existingRow = await db.select().from(forceChannels).where(eq(forceChannels.channel_id, chId)).get();
+    if (!existingRow) {
+      const chCount = (await db.select({ c: count() }).from(forceChannels).where(eq(forceChannels.is_active, true)).get())?.c || 0;
+      if (chCount >= LIMITS.MAX_FORCE_JOIN_CHANNELS) {
+        return sendMsg(chatId, t(lang, 'fj_wizard_max_limit', { max: LIMITS.MAX_FORCE_JOIN_CHANNELS }));
+      }
     }
     const me = await tgApi.getMe({});
     const member = await tgApi.getChatMember({ chat_id: chId, user_id: me.id }).catch(() => null);
     if (!member || (member.status !== 'administrator' && member.status !== 'creator')) {
       return sendMsg(chatId, t(lang, 'fj_wizard_bot_not_admin'));
     }
+    const oldInviteLink = existingRow?.invite_link;
     const linkParams = { chat_id: chId, creates_join_request: false };
     if (targetLimit > 0) {
       linkParams.member_limit = targetLimit;
@@ -98,6 +102,9 @@ export async function handleForceJoinCommand(cmd, arg, message, userId, chatId, 
         is_active: true,
       },
     }).run();
+    if (oldInviteLink && oldInviteLink !== linkObj.invite_link) {
+      await tgApi.revokeChatInviteLink({ chat_id: chId, invite_link: oldInviteLink }).catch(() => {});
+    }
     return sendMsg(chatId, t(lang, 'fj_wizard_success', {
       title: escapeHtml(chName),
       btn: escapeHtml(buttonText || chName),
@@ -131,11 +138,15 @@ export async function handleForceJoinCommand(cmd, arg, message, userId, chatId, 
 
 export async function handleForceJoinPrompt(session, text, userId, chatId, lang) {
   if (session.mode === 'fj_label') {
-    await clearAdminSession(userId);
+    const cleared = await clearAdminSession(userId, session);
+    if ((cleared?.rowsAffected ?? 0) !== 1) return false;
     const label = (text || '').trim();
+    if (label.length < 2 || label.length > 40) {
+      return sendMsg(chatId, t(lang, 'fj_setchannelbtn_usage'));
+    }
     const chId = session.code;
     if (chId) {
-      await db.update(forceChannels).set({ channel_name: label }).where(eq(forceChannels.channel_id, chId)).run();
+      await db.update(forceChannels).set({ button_text: label }).where(eq(forceChannels.channel_id, chId)).run();
     }
     return sendMsg(chatId, t(lang, 'fj_label_updated', { name: escapeHtml(label) }));
   }
@@ -151,19 +162,20 @@ export async function handleForceJoinPrompt(session, text, userId, chatId, lang)
     const chId = session.code;
     const ch = await db.select().from(forceChannels).where(eq(forceChannels.channel_id, chId)).get();
     if (!ch) {
-      await clearAdminSession(userId);
+      await clearAdminSession(userId, session);
       return renderForceJoinAdminPanel(chatId, null, lang, false);
     }
-    if (ch.invite_link) {
-      await tgApi.revokeChatInviteLink({ chat_id: chId, invite_link: ch.invite_link }).catch(() => {});
-    }
+    // Consume the observed prompt before creating a link or changing its
+    // channel. Losing the session fence means a newer operation owns it.
+    const cleared = await clearAdminSession(userId, session);
+    if ((cleared?.rowsAffected ?? 0) !== 1) return false;
+    const oldInviteLink = ch.invite_link;
     const linkParams = { chat_id: chId, creates_join_request: false };
     if (newLimit > 0) {
       linkParams.member_limit = newLimit;
     }
     const linkObj = await tgApi.createChatInviteLink(linkParams).catch(() => null);
     if (!linkObj?.invite_link) {
-      await clearAdminSession(userId);
       return sendMsg(chatId, t(lang, 'fj_wizard_create_link_err', { err: 'Link error' }));
     }
     await db.update(forceChannels).set({
@@ -171,13 +183,15 @@ export async function handleForceJoinPrompt(session, text, userId, chatId, lang)
       target_limit: newLimit,
       is_active: true,
     }).where(eq(forceChannels.channel_id, chId)).run();
-    await clearAdminSession(userId);
+    if (oldInviteLink && oldInviteLink !== linkObj.invite_link) {
+      await tgApi.revokeChatInviteLink({ chat_id: chId, invite_link: oldInviteLink }).catch(() => {});
+    }
     await sendMsg(chatId, t(lang, 'fj_renew_success', {
       limit: newLimit > 0 ? String(newLimit) : t(lang, 'fj_wizard_unlimited'),
       link: escapeHtml(linkObj.invite_link)
     }));
     return renderForceJoinAdminPanel(chatId, null, lang, false);
   }
-  await clearAdminSession(userId);
+  await clearAdminSession(userId, session);
   return false;
 }

@@ -1,5 +1,6 @@
 import { db } from 'sdk';
-import { like } from 'sdk/db';
+import { and, like } from 'sdk/db';
+import { bundleAvailable } from '../bundles/lifecycle.js';
 import { bundles } from '../../schema.js';
 import { sendMsg, escapeHtml, getBotUsername } from '../helpers.js';
 import { t } from '../locales/index.js';
@@ -8,7 +9,7 @@ export async function handleSearchCommand(arg, chatId, lang) {
   if (!arg) return sendMsg(chatId, t(lang, 'search_usage'));
   const rows = await db.select({ code: bundles.code, title: bundles.title })
     .from(bundles)
-    .where(like(bundles.title, `%${arg}%`))
+    .where(and(like(bundles.title, `%${arg}%`), bundleAvailable()))
     .limit(10)
     .all();
   if (!rows?.length) return sendMsg(chatId, t(lang, 'search_no_results'));
