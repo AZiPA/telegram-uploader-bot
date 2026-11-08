@@ -6,8 +6,7 @@
 
 > [!TIP]
 > **علاقه‌مند به نسخه کلودفلر (Cloudflare Workers + D1) هستید؟**
-> می‌توانید به مخزن همکار [telegram-filestore-bot](https://github.com/your-org/telegram-filestore-bot) مراجعه کنید که بر پایه Cloudflare Workers و پایگاه داده D1 پیاده‌سازی شده است.
-
+> می‌توانید به مخزن همکار [telegram-uploader-bot-cloudflare](https://github.com/AZiPA/telegram-uploader-bot-cloudflare) مراجعه کنید که بر پایه Cloudflare Workers و پایگاه داده D1 پیاده‌سازی شده است.
 ---
 
 ## بررسی اجمالی و معماری با هزینه صفر
